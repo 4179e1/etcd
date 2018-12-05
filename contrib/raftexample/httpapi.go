@@ -29,8 +29,16 @@ type httpKVAPI struct {
 	confChangeC chan<- raftpb.ConfChange
 }
 
+// PUT : propose a key
+// GET : get a key
+// POST: config change, add a node
+// DELETE: config change, delete a node
+// see go http framework here: https://www.alexedwards.net/blog/a-recap-of-request-handling
+
 func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// --> here's the key
 	key := r.RequestURI
+	log.Printf(key)
 	switch {
 	case r.Method == "PUT":
 		v, err := ioutil.ReadAll(r.Body)

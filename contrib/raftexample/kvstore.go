@@ -40,6 +40,7 @@ type kv struct {
 func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <-chan *string, errorC <-chan error) *kvstore {
 	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string), snapshotter: snapshotter}
 	// replay log into key-value map
+	// --> for the first time, it will return since there were no snapshot, weird design
 	s.readCommits(commitC, errorC)
 	// read commits from raft into kvStore map until error
 	go s.readCommits(commitC, errorC)
@@ -89,6 +90,7 @@ func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
 		s.kvStore[dataKv.Key] = dataKv.Val
 		s.mu.Unlock()
 	}
+	// --> won't it block ?
 	if err, ok := <-errorC; ok {
 		log.Fatal(err)
 	}
