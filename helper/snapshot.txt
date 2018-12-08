@@ -1,0 +1,9 @@
+raftNode {
+    ... 
+    snapshotter         *snap.Snapshotter
+    snapshotterReady    chan *snap.Snapshotter
+    ...
+}
+
+newRaftNode():
+    
