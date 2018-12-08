@@ -435,6 +435,7 @@ func (rc *raftNode) serveChannels() {
 				rc.publishSnapshot(rd.Snapshot)
 			}
 			rc.raftStorage.Append(rd.Entries)
+			// --> who did you send?
 			rc.transport.Send(rd.Messages)
 			if ok := rc.publishEntries(rc.entriesToApply(rd.CommittedEntries)); !ok {
 				rc.stop()

@@ -1,3 +1,4 @@
+- main snap
 raftNode {
     ... 
     snapshotter         *snap.Snapshotter
@@ -6,4 +7,22 @@ raftNode {
 }
 
 newRaftNode():
-    
+  |  rc = &aftNode {
+  |      snapshotterReady : make (chan *snap.Snapshotter, 1)
+  |  }
+  |- go rc.startRaft()
+  |  |- os.Mkdir (rc.sanpdir)
+  |  |- rc.snapshotter = snap.New (zap.NewExample(), rc.snapdir) //zap 是一个*结构化*的logging library
+
+
+- raftpb
+type Snapshot struct {
+	Data             []byte           `protobuf:"bytes,1,opt,name=data" json:"data,omitempty"`
+	Metadata         SnapshotMetadata `protobuf:"bytes,2,opt,name=metadata" json:"metadata"`
+	XXX_unrecognized []byte           `json:"-"`
+}
+
+
+- etcdserver/api/snap
+
+func New(lg *zap.Logger, dir string) *sanpshotter
