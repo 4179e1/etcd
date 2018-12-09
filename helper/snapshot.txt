@@ -26,3 +26,20 @@ type Snapshot struct {
 - etcdserver/api/snap
 
 func New(lg *zap.Logger, dir string) *sanpshotter
+func (s *Snapshotter) SaveSnap (snapshot *raftpb.Snapshot) error
+|- s.save()
+|  |- b = pbutil.MustMarshal(snapshot)
+|  |- crc = crc32 (b)
+|  |- snap = snappb.Snapshot (Crc: crc, Data b)
+|  |- d = snap.Marshal()
+|  |- pioutil.WriteAndSyncFile (d)
+  
+func (s *Snapshotter) Load()
+|- names = snapNames() // find snapshot files with extension .snap
+|  loadSnap (names) // a loop, break once a snapshot were loaded successfully
+|  |- snap = Read()  // rename .snap to .broken when failed  
+|  |  |-  b = ioutil.ReadFile()
+|  |  |-  serializedSnap =  snappb.Unmarshal (b) 
+|  |  |-  check serializedSnap CRC
+|  |  |-  snap = snap.Unmarshal (serialized.Data)
+|  |  |-  return snap
