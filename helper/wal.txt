@@ -1,3 +1,26 @@
+- wal/walpb/record.pb.go
+
+Type: 
+	metadataType int64 = iota + 1
+	entryType
+	stateType
+	crcType
+	snapshotType
+
+type Record struct {
+	Type             int64  `protobuf:"varint,1,opt,name=type" json:"type"`
+	Crc              uint32 `protobuf:"varint,2,opt,name=crc" json:"crc"`
+	Data             []byte `protobuf:"bytes,3,opt,name=data" json:"data,omitempty"`
+	XXX_unrecognized []byte `json:"-"`
+}
+
+type Snapshot struct {
+	Index            uint64 `protobuf:"varint,1,opt,name=index" json:"index"`
+	Term             uint64 `protobuf:"varint,2,opt,name=term" json:"term"`
+	XXX_unrecognized []byte `json:"-"`
+}
+
+- wal/wal.go
 type WAL struct {
 	lg *zap.Logger
 
@@ -26,6 +49,41 @@ func Create (lg *zap.Logger, dirpath string, metadata []byte) (*WAL, error)
 |- tmpdirpath := filepath.Clean(dirpath) + ".tmp"
 |- fileutil.CreateDirAll (tmpdirpath)
 |- p := filepath.Join (tmpdirpath, walName(0, 0))
-|- fileutil.LockFile (p, s.O_WRONLY|os.O_CREATE, fileutil.PrivateFileMode) // syscall.Flock()
-|- f.Seek (0, io.SeekEnd) // for what?
+|- f := fileutil.LockFile (p, s.O_WRONLY|os.O_CREATE, fileutil.PrivateFileMode) // syscall.Flock()
+|- f.Seek (0, io.SeekEnd) // go to the end of the file, but why? shouldn't it empty?
 |- fileutil.Preallocate(f.File, SegmentSizeBytes, true)
+|- w := &WAL {...}
+|- w.encoder := newFileEncoder (f.File, prevCrc : 0)
+|  |- offset := f.Seek (0, io.SeekCurrent)    // get current offset
+|  |- newEncoder (f, prevCrc, pageOffset) 
+|     |- see below
+|- w.saveCrc(0)
+|  |- w.encoder.encode(&walpb.Record{Type: crcType, Crc: prevCrc})
+|- w.locks.append (f)               //<--- it's a lock list
+|- w.encoder.encode(&walpb.Record{Type: metadataType, Data: metadata})
+|- w.SaveSnapshot(walpb.Snapshot{}) //TODO
+|- w = w.renameWAL (tmpdirpath)
+|- //directory was renamed; sync parent dir to persist rename...
+|- //That's open parent dir, fsync, close
+
+
+walpb types
+
+- wal/encoder.go
+func newEncoder(w io.Writer, prevCrc uint32, pageOffset int) *encoder {
+	return &encoder{
+		bw:  ioutil.NewPageWriter(w, walPageBytes, pageOffset),
+		crc: crc.New(prevCrc, crcTable),
+		// 1MB buffer
+		buf:       make([]byte, 1024*1024),
+		uint64buf: make([]byte, 8),
+	}
+}
+
+func  (e *encoder) encode(rec *walpb.Record)
+|- e.mu.Lock()
+|- //set rec.Crc
+|- data = rec.Marshal
+|- // padding data to force 8 bytes alignment
+|- // e.bw.Write (len (data)) // TODO: really?
+|- e.bw.write (data)
