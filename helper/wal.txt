@@ -20,3 +20,12 @@ type WAL struct {
 	locks []*fileutil.LockedFile // the locked files the WAL holds (the name is increasing)
 	fp    *filePipeline
 }
+
+func Create (lg *zap.Logger, dirpath string, metadata []byte) (*WAL, error)
+|- Exist (dirpath)
+|- tmpdirpath := filepath.Clean(dirpath) + ".tmp"
+|- fileutil.CreateDirAll (tmpdirpath)
+|- p := filepath.Join (tmpdirpath, walName(0, 0))
+|- fileutil.LockFile (p, s.O_WRONLY|os.O_CREATE, fileutil.PrivateFileMode) // syscall.Flock()
+|- f.Seek (0, io.SeekEnd) // for what?
+|- fileutil.Preallocate(f.File, SegmentSizeBytes, true)

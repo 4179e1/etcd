@@ -13,6 +13,7 @@ newRaftNode():
   |- go rc.startRaft()
   |  |- os.Mkdir (rc.sanpdir)
   |  |- rc.snapshotter = snap.New (zap.NewExample(), rc.snapdir) //zap 是一个*结构化*的logging library
+  |  |- rc.snapshotterReady <- rc.snapshotter
 
 
 - raftpb
