@@ -1,3 +1,7 @@
+See: https://my.oschina.net/fileoptions/blog/1825531
+     https://blog.zhesih.com/2017/10/03/the-wal-files-in-etcd-v3/
+Reference: https://work.tinou.com/2012/09/write-ahead-log.html
+
 - wal/walpb/record.pb.go
 
 Type: 
@@ -62,12 +66,40 @@ func Create (lg *zap.Logger, dirpath string, metadata []byte) (*WAL, error)
 |- w.locks.append (f)               //<--- it's a lock list
 |- w.encoder.encode(&walpb.Record{Type: metadataType, Data: metadata})
 |- w.SaveSnapshot(walpb.Snapshot{}) //TODO
+|  |- b:= pbutil.MustMarshal (&e)
+|  |- w.mu.Lock()
+|  |- rec := &walpb.Record {Type: snapshotType, Data: b}
+|  |- w.encoder.encode (rec)
+|  |- w.sync()
+|     |- w.encoder.flush()
+|     |- fileutil.Fdatasync (w.tail().File)
+|        |- Fsync (f)
+|        |- syscall.Syscall (syscall.SYS_FCNT, f.Fd(), uintptr(syscall.F_FULLFSYNC), uintptr(0))
 |- w = w.renameWAL (tmpdirpath)
+|  |- os.RemoveAll (w.dir) // the dir without ".tmp"
+|  |- os.Rename (tmpdirpath, w.dir) // For windows, close, rename, open
+|  |- w.fp = newFilePipeline (w.lg, w.dir, SegmentSizeBytes)
+|  |- w.dirFile = fileutil.OpenDir (w.dir)
 |- //directory was renamed; sync parent dir to persist rename...
 |- //That's open parent dir, fsync, close
 
 
-walpb types
+- wal/file_pipeline.go
+type filePipeline struct {
+	lg *zap.Logger
+
+	// dir to put files
+	dir string
+	// size of files to make, in bytes
+	size int64
+	// count number of files generated
+	count int
+
+	filec chan *fileutil.LockedFile
+	errc  chan error
+	donec chan struct{}
+}
+
 
 - wal/encoder.go
 func newEncoder(w io.Writer, prevCrc uint32, pageOffset int) *encoder {
