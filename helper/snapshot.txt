@@ -23,6 +23,12 @@ type Snapshot struct {
 	XXX_unrecognized []byte           `json:"-"`
 }
 
+type ConfState struct {
+	Nodes            []uint64 `protobuf:"varint,1,rep,name=nodes" json:"nodes,omitempty"`
+	Learners         []uint64 `protobuf:"varint,2,rep,name=learners" json:"learners,omitempty"`
+	XXX_unrecognized []byte   `json:"-"`
+}
+
 - snappb
 type Snapshot struct {
 	Crc              uint32 `protobuf:"varint,1,opt,name=crc" json:"crc"`
@@ -36,6 +42,7 @@ type Snapshot struct {
 func New(lg *zap.Logger, dir string) *sanpshotter
 func (s *Snapshotter) SaveSnap (snapshot *raftpb.Snapshot) error
 |- s.save()
+|  |- fname := <snapshot.Metadata.Term>-<snapshot.Metadata.Index>.snap
 |  |- b = pbutil.MustMarshal(snapshot)
 |  |- crc = crc32 (b)
 |  |- snap = snappb.Snapshot (Crc: crc, Data b)

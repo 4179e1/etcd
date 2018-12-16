@@ -1,6 +1,9 @@
-See: https://my.oschina.net/fileoptions/blog/1825531
-     https://blog.zhesih.com/2017/10/03/the-wal-files-in-etcd-v3/
-Reference: https://work.tinou.com/2012/09/write-ahead-log.html
+See: 
+https://my.oschina.net/fileoptions/blog/1825531
+https://blog.zhesih.com/2017/10/03/the-wal-files-in-etcd-v3/
+
+Reference: 
+https://work.tinou.com/2012/09/write-ahead-log.html
 
 - wal/walpb/record.pb.go
 
@@ -48,6 +51,14 @@ type WAL struct {
 	fp    *filePipeline
 }
 
+- 创建<waldir>.tmp 目录，并在下面创建<seq>-<index>.wal命名的wal文件, 带上文件锁
+- 创建WAL 对象
+- 创建encoder对象
+- encoder写入metadata
+- encoder写入空的walpb.Snapshot
+- <waldir>.tmp 重命名为<waldir>
+  - 创建filePipeline 0.tmp 1.tmp
+
 func Create (lg *zap.Logger, dirpath string, metadata []byte) (*WAL, error)
 |- Exist (dirpath)
 |- tmpdirpath := filepath.Clean(dirpath) + ".tmp"
@@ -62,7 +73,7 @@ func Create (lg *zap.Logger, dirpath string, metadata []byte) (*WAL, error)
 |  |- newEncoder (f, prevCrc, pageOffset) 
 |     |- see below
 |- w.saveCrc(0)
-|  |- w.encoder.encode(&walpb.Record{Type: crcType, Crc: prevCrc})
+|  |- w.encoder.encode(&walpb.Record{Type: crcType, Crc: prevCrc}) // TODO: what?
 |- w.locks.append (f)               //<--- it's a lock list
 |- w.encoder.encode(&walpb.Record{Type: metadataType, Data: metadata})
 |- w.SaveSnapshot(walpb.Snapshot{}) //TODO
@@ -77,11 +88,61 @@ func Create (lg *zap.Logger, dirpath string, metadata []byte) (*WAL, error)
 |        |- syscall.Syscall (syscall.SYS_FCNT, f.Fd(), uintptr(syscall.F_FULLFSYNC), uintptr(0))
 |- w = w.renameWAL (tmpdirpath)
 |  |- os.RemoveAll (w.dir) // the dir without ".tmp"
-|  |- os.Rename (tmpdirpath, w.dir) // For windows, close, rename, open
+|  |- os.Rename (tmpdirpath, w.dir) // rename won't work for locked file on windows,
+|  |  - w.renameWALUnlock (tmpdirapth) // call wal.renameWalUnlock() instead, that's close, rename, open
+|  |    |- w.Close()
+|  |       |- w.sync()
+|  |    |- os.Rename (tmpdirpath, w.dir)
+|  |    |- newWal := Open (w.lg, w.dir, walpb.Sanpshot{})
+|  |    |- newWal.ReadAll()
+|  |    |- return newWAL
 |  |- w.fp = newFilePipeline (w.lg, w.dir, SegmentSizeBytes)
 |  |- w.dirFile = fileutil.OpenDir (w.dir)
 |- //directory was renamed; sync parent dir to persist rename...
 |- //That's open parent dir, fsync, close
+
+
+// Open opens the WAL at the given snap.
+// The snap SHOULD have been previously saved to the WAL, or the following
+// ReadAll will fail.
+func Open(lg *zap.Logger, dirpath string snap walpb.Snapshot) (*WAL, error)
+|- w := openAtIndex (lg, dirpath, snap, write: true)
+|  |- names := readWALNanmes(ld, dirpath) // find <seq>-<index>.wal, ignore .tmp files
+|  |- nameIndex := searchIndex (names, snap.Index) // find <seq>-<index>.wal whose <index> > snap.Index
+|  |- make 3 slice io.ReadClosed, io.Reader, *fileutil.LockedFile, append the matched .wal above
+|  |- w := &WAL {start: snap, decoder: newDecoder (rs...), readClose: closer, locks: ls, ...}
+|  |- write only: w.fp = newFilePipeline()
+|- w.dirFile = fileutil.OpenDIr (w.dir)
+|- return w
+
+func (w *WAL) Save (st raftpb.HardState, ents []raftpb.Entry) error
+|- mustSync = raft.MustSync (st, w.state, len (ents)) // check whether a sync() required
+|- w.saveEntry (&ents[*])
+|  |- b := pbutil.MustMarshal (e)
+|  |- rec := &walpb.Record {entType, b}
+|  |- w.encoder.encode (rec)
+|  |- w.enti = e.Index
+|- w.saveState (&st)
+|  |- w.encode (stateType) // long story short
+|- if not cut off (cur offset < SegmentSizeBytes 64MB), try w.sync()
+|- else return w.cut()
+|  |- // cut closes current file written and creates a new one ready to append.
+|  |- // cut first creates a temp wal file and writes necessary headers into it.
+|  |- // Then cut atomically rename temp wal file to a wal file.
+|  |- get cur off set, Truncate, sync
+|  |- fpath:= w.dir + walName (w.seq() + 1, w.enti + 1)
+|  |- w.locks.append (w.fp.Open()) // from tmp file, append one to locks
+|  |- w.encoder := newFileEncoder
+|  |- w.encoder.encode (&walpb.Record{metadataType})
+|  |- w.saveState (&st)
+|  |- w.sync()
+|  |- Rename ({0,1}.tmp ===> fpath (<seq>-<index>.wal))
+|  |- Close(), and reopen as using new path... and a newFileEncoder()...
+
+// After ReadAll, the WAL will be ready for appending new records.
+func (w *WAL) ReadAll() (metadata []byte, state raftpb.HardState, ents []raftpb.Entry, err error)
+|- TODO too complicate, don't understand
+
 
 
 - wal/file_pipeline.go
@@ -100,6 +161,8 @@ type filePipeline struct {
 	donec chan struct{}
 }
 
+(fp *filePipeline) Open () (f *fileutil.LockedFile, err error) 
+|- return a locked file (0.tmp or 1.tmp) from fp.filec
 
 - wal/encoder.go
 func newEncoder(w io.Writer, prevCrc uint32, pageOffset int) *encoder {
@@ -116,6 +179,40 @@ func  (e *encoder) encode(rec *walpb.Record)
 |- e.mu.Lock()
 |- //set rec.Crc
 |- data = rec.Marshal
-|- // padding data to force 8 bytes alignment
-|- // e.bw.Write (len (data)) // TODO: really?
+|- lenField, padBytes := encodeFrameSize (len(data)), // padBytes: length to padding for 8 bytes alignment
+|-                    // 64 bit: 1 bit : padding flag, 3 bit: padding length, 4 bit: not used, 56 bit: length
+|- e.bw.Write (lenField)
 |- e.bw.write (data)
+
+
+- wal/decoder.go
+type decoder struct {
+	mu  sync.Mutex
+	brs []*bufio.Reader
+
+	// lastValidOff file offset following the last valid decoded record
+	lastValidOff int64
+	crc          hash.Hash32
+}
+
+func newDecorder (r...io.reader) *decoder {
+    return &decoder {
+        brs: readers ===> bufio.Reader (r)
+        crc: crc.New(0, crcTable)
+    }
+}
+
+
+// 貌似…… 每次调用decode就会读取一段Record，直到一个文件返回EOF，递归读下一个，当所有文件都到了结尾，返回EOF 
+func (d *decoder) decode (rec *walpb.Record) 
+|- rec.Reset () // WTF is this !!!,  hmm, rec were the return value ??? yes !!!
+|- d.decodeRecord(rec) // a recursive func, TODO: but why?
+|  |- l := readInt64(d.brs[0]) // read record length
+|  |- recBytes, padBytes := decodeFrameSize (l) //recBytes: lower 56 bits, paBytes 
+|  |- data := make([]byte, recBytes + padBytes)
+|  |- io.readFull (d.brs[0], data)
+|  |- rec.UnMarshal (data[:recBytes]) // check if isTornEntry()
+|  |- isTornEntry (data)
+|  |  |- slice data into minSectorSize Chunks, if any data for a sector chunk is all 0, it's a torn write
+|  |  |- I get the idea, but how does this happen?
+|  |- d.lastValidOff += frameSizeBytes + recBytes + padBytes
