@@ -11,7 +11,7 @@ main()                                  main.go
   |   |-snap.New()                      snap/snapshotter.go 只是实例化一个对象，并设置其中的dir成员
   |   |-wal.Exist()                     wal/util.go 判断WAL日志目录是否存在，用来确定是否是第一次启动
   |   |-raftNode.replayWAL()            raft.go 开始读取WAL日志，并赋值到raftNode.wal中
-  |   | |-raftNode.loadSnapshot()
+  |   | |-raftNode.loadSnapshot()       读取最新的snapshot, 如果有的话
   |   | | |-snap.Snapshotter.Load()     snap/snapshotter.go 中的Load()函数
   |   | |   |-Snapshotter.snapNames()   会打开目录并遍历目录下的文件，按照文件名进行排序
   |   | |   |-Snapshotter.loadSnap()
@@ -106,3 +106,11 @@ raft.stepCandidate()
 
 node.run()
  |--->                                  【raft.node ... elected leader at term ...】
+
+
+func (rc *raftNode)raftNode.replayWAL()  *wal.WAL 
+|-snapshot ：= raftNode.loadSnapshot()       - 从snap文件中找到最后一个并加载（如果有的话），里面记录了term和index
+|-raftNode.openWAL(snapshot)           
+| |-wal.Create (rc.waldir) if ! wal.Exit(rc.waldir) 如果不存在WAL目录/文件则创建，wal文件名为<seq>-<index>.wal
+| |-wal.Open(sanpshot)          找到最后一个index <= snapshot.index的wal并打开，注意wal.decoder会一直加载后续的wal文件，直到EOF
+|-ReadAll()                     读取所有日志，真正开始读取WAL

@@ -17,16 +17,23 @@ newRaftNode():
 
 
 - raftpb
-type Snapshot struct {
-	Data             []byte           `protobuf:"bytes,1,opt,name=data" json:"data,omitempty"`
-	Metadata         SnapshotMetadata `protobuf:"bytes,2,opt,name=metadata" json:"metadata"`
-	XXX_unrecognized []byte           `json:"-"`
-}
-
 type ConfState struct {
 	Nodes            []uint64 `protobuf:"varint,1,rep,name=nodes" json:"nodes,omitempty"`
 	Learners         []uint64 `protobuf:"varint,2,rep,name=learners" json:"learners,omitempty"`
 	XXX_unrecognized []byte   `json:"-"`
+}
+
+type SnapshotMetadata struct {
+	ConfState        ConfState `protobuf:"bytes,1,opt,name=conf_state,json=confState" json:"conf_state"`
+	Index            uint64    `protobuf:"varint,2,opt,name=index" json:"index"`
+	Term             uint64    `protobuf:"varint,3,opt,name=term" json:"term"`
+	XXX_unrecognized []byte    `json:"-"`
+}
+
+type Snapshot struct {
+	Data             []byte           `protobuf:"bytes,1,opt,name=data" json:"data,omitempty"`
+	Metadata         SnapshotMetadata `protobuf:"bytes,2,opt,name=metadata" json:"metadata"`
+	XXX_unrecognized []byte           `json:"-"`
 }
 
 - snappb
