@@ -63,12 +63,16 @@ func (s *kvstore) Propose(k string, v string) {
 }
 
 func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
+	log.Printf("---- readCommits() BEGIN ----")
+	defer log.Printf("--- readCommits() QUIT ----")
 	for data := range commitC {
 		if data == nil {
 			// done replaying log; new data incoming
 			// OR signaled to load snapshot
+			log.Printf("nil data detected")
 			snapshot, err := s.snapshotter.Load()
 			if err == snap.ErrNoSnapshot {
+				log.Printf("no snapshot detected, return")
 				return
 			}
 			if err != nil {
@@ -86,6 +90,7 @@ func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
 		if err := dec.Decode(&dataKv); err != nil {
 			log.Fatalf("raftexample: could not decode message (%v)", err)
 		}
+		log.Printf("Data: %v", dataKv)
 		s.mu.Lock()
 		s.kvStore[dataKv.Key] = dataKv.Val
 		s.mu.Unlock()

@@ -240,11 +240,14 @@ func (rc *raftNode) replayWAL() *wal.WAL {
 
 	// append to storage so raft starts at the right place in log
 	rc.raftStorage.Append(ents)
+
+	log.Printf("Raft NewMemoryStorage() with snapshot %v, st %v, ents %v", snapshot, st, ents)
 	// send nil once lastIndex is published so client knows commit channel is current
 	if len(ents) > 0 {
 		rc.lastIndex = ents[len(ents)-1].Index
 	} else {
 		rc.commitC <- nil
+		log.Printf("<--- I commit a nil here")
 	}
 	return w
 }
