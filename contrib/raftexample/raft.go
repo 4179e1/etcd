@@ -151,11 +151,13 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) bool {
 			s := string(ents[i].Data)
 			select {
 			case rc.commitC <- &s:
+				log.Printf("<-- commit EntryNormal %v", s)
 			case <-rc.stopc:
 				return false
 			}
 
 		case raftpb.EntryConfChange:
+			log.Printf("On Conf Change")
 			var cc raftpb.ConfChange
 			cc.Unmarshal(ents[i].Data)
 			rc.confState = *rc.node.ApplyConfChange(cc)
@@ -180,6 +182,7 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) bool {
 		if ents[i].Index == rc.lastIndex {
 			select {
 			case rc.commitC <- nil:
+				log.Printf("<-- commit nil in publishEntries()")
 			case <-rc.stopc:
 				return false
 			}
@@ -431,11 +434,13 @@ func (rc *raftNode) serveChannels() {
 
 		// store raft entries to wal, then publish over commit channel
 		case rd := <-rc.node.Ready():
+			//log.Printf("<-- rc.node.Ready(): %v --->", rd)
 			rc.wal.Save(rd.HardState, rd.Entries)
 			if !raft.IsEmptySnap(rd.Snapshot) {
 				rc.saveSnap(rd.Snapshot)
 				rc.raftStorage.ApplySnapshot(rd.Snapshot)
 				rc.publishSnapshot(rd.Snapshot)
+				log.Printf("<-- publishing a snapshot --->", rd)
 			}
 			rc.raftStorage.Append(rd.Entries)
 			// --> who did you send?

@@ -38,7 +38,6 @@ type httpKVAPI struct {
 func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// --> here's the key
 	key := r.RequestURI
-	log.Printf(key)
 	switch {
 	case r.Method == "PUT":
 		v, err := ioutil.ReadAll(r.Body)
