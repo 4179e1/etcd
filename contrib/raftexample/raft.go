@@ -70,7 +70,8 @@ type raftNode struct {
 	httpdonec chan struct{} // signals http server shutdown complete
 }
 
-var defaultSnapshotCount uint64 = 100
+//var defaultSnapshotCount uint64 = 100
+var defaultSnapshotCount uint64 = 10
 
 // newRaftNode initiates a raft instance and returns a committed log entry
 // channel and error channel. Proposals for log updates are sent over the
@@ -150,6 +151,7 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) bool {
 			s := string(ents[i].Data)
 			select {
 			case rc.commitC <- &s:
+				log.Printf("publishEntries: %v", s)
 			case <-rc.stopc:
 				return false
 			}
@@ -160,10 +162,12 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) bool {
 			rc.confState = *rc.node.ApplyConfChange(cc)
 			switch cc.Type {
 			case raftpb.ConfChangeAddNode:
+				log.Printf("publishEntries: ConfChangeAddNode")
 				if len(cc.Context) > 0 {
 					rc.transport.AddPeer(types.ID(cc.NodeID), []string{string(cc.Context)})
 				}
 			case raftpb.ConfChangeRemoveNode:
+				log.Printf("publishEntries: ConfChangeRemoveNode")
 				if cc.NodeID == uint64(rc.id) {
 					log.Println("I've been removed from the cluster! Shutting down.")
 					return false
@@ -232,6 +236,7 @@ func (rc *raftNode) replayWAL() *wal.WAL {
 	rc.raftStorage.Append(ents)
 
 	// send nil so client knows commit channel is current
+	log.Printf("<--- commit nil in replayWAL(): reply done")
 	rc.commitC <- nil
 	return w
 }
@@ -331,10 +336,12 @@ func (rc *raftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) {
 	rc.snapshotIndex = snapshotToSave.Metadata.Index
 	rc.appliedIndex = snapshotToSave.Metadata.Index
 
+	log.Printf("<--- commit nil in publishSnapshot")
 	rc.commitC <- nil // trigger kvstore to load snapshot
 }
 
-var snapshotCatchUpEntriesN uint64 = 100
+//var snapshotCatchUpEntriesN uint64 = 100
+var snapshotCatchUpEntriesN uint64 = 10
 
 func (rc *raftNode) maybeTriggerSnapshot() {
 	if rc.getSnapshot == nil {

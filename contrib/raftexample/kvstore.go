@@ -75,6 +75,7 @@ func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
 			if err := s.recoverFromSnapshot(snapshot.Data); err != nil {
 				log.Panic(err)
 			}
+			log.Printf("---> recoverFromSnapshot() <---")
 			continue
 		}
 
@@ -83,6 +84,7 @@ func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
 		if err := dec.Decode(&dataKv); err != nil {
 			log.Fatalf("raftexample: could not decode message (%v)", err)
 		}
+		log.Printf("---> %v <---", dataKv)
 		s.mu.Lock()
 		s.kvStore[dataKv.Key] = dataKv.Val
 		s.mu.Unlock()
