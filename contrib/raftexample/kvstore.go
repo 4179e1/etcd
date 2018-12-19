@@ -40,7 +40,6 @@ type kv struct {
 func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <-chan *string, errorC <-chan error) *kvstore {
 	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string), snapshotter: snapshotter}
 	// replay log into key-value map
-	// --> for the first time, it will return since there were no snapshot, weird design
 	s.readCommits(commitC, errorC)
 	// read commits from raft into kvStore map until error
 	go s.readCommits(commitC, errorC)
@@ -63,16 +62,12 @@ func (s *kvstore) Propose(k string, v string) {
 }
 
 func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
-	log.Printf("---- readCommits() BEGIN ----")
-	defer log.Printf("--- readCommits() QUIT ----")
 	for data := range commitC {
 		if data == nil {
 			// done replaying log; new data incoming
 			// OR signaled to load snapshot
-			log.Printf("nil data detected")
 			snapshot, err := s.snapshotter.Load()
 			if err == snap.ErrNoSnapshot {
-				log.Printf("no snapshot detected, return")
 				return
 			}
 			if err != nil {
@@ -82,7 +77,6 @@ func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
 			if err := s.recoverFromSnapshot(snapshot.Data); err != nil {
 				log.Panic(err)
 			}
-			// continue or return?
 			continue
 		}
 
@@ -91,12 +85,10 @@ func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
 		if err := dec.Decode(&dataKv); err != nil {
 			log.Fatalf("raftexample: could not decode message (%v)", err)
 		}
-		log.Printf("Data: %v", dataKv)
 		s.mu.Lock()
 		s.kvStore[dataKv.Key] = dataKv.Val
 		s.mu.Unlock()
 	}
-	// --> won't it block ?
 	if err, ok := <-errorC; ok {
 		log.Fatal(err)
 	}

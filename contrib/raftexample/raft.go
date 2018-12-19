@@ -71,8 +71,7 @@ type raftNode struct {
 	httpdonec chan struct{} // signals http server shutdown complete
 }
 
-//var defaultSnapshotCount uint64 = 10000
-var defaultSnapshotCount uint64 = 10
+var defaultSnapshotCount uint64 = 10000
 
 // newRaftNode initiates a raft instance and returns a committed log entry
 // channel and error channel. Proposals for log updates are sent over the
@@ -152,13 +151,11 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) bool {
 			s := string(ents[i].Data)
 			select {
 			case rc.commitC <- &s:
-				log.Printf("<-- commit EntryNormal %v", s)
 			case <-rc.stopc:
 				return false
 			}
 
 		case raftpb.EntryConfChange:
-			log.Printf("On Conf Change")
 			var cc raftpb.ConfChange
 			cc.Unmarshal(ents[i].Data)
 			rc.confState = *rc.node.ApplyConfChange(cc)
@@ -183,7 +180,6 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) bool {
 		if ents[i].Index == rc.lastIndex {
 			select {
 			case rc.commitC <- nil:
-				log.Printf("<-- commit nil in publishEntries()")
 			case <-rc.stopc:
 				return false
 			}
@@ -244,14 +240,11 @@ func (rc *raftNode) replayWAL() *wal.WAL {
 
 	// append to storage so raft starts at the right place in log
 	rc.raftStorage.Append(ents)
-
-	log.Printf("Raft NewMemoryStorage() with snapshot %v, st %v, ents %v", snapshot, st, ents)
 	// send nil once lastIndex is published so client knows commit channel is current
 	if len(ents) > 0 {
 		rc.lastIndex = ents[len(ents)-1].Index
 	} else {
 		rc.commitC <- nil
-		log.Printf("<--- I commit a nil here")
 	}
 	return w
 }
@@ -346,7 +339,6 @@ func (rc *raftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) {
 	if snapshotToSave.Metadata.Index <= rc.appliedIndex {
 		log.Fatalf("snapshot index [%d] should > progress.appliedIndex [%d]", snapshotToSave.Metadata.Index, rc.appliedIndex)
 	}
-	log.Printf("publishSnapshot() commit nil")
 	rc.commitC <- nil // trigger kvstore to load snapshot
 
 	rc.confState = snapshotToSave.Metadata.ConfState
@@ -354,8 +346,7 @@ func (rc *raftNode) publishSnapshot(snapshotToSave raftpb.Snapshot) {
 	rc.appliedIndex = snapshotToSave.Metadata.Index
 }
 
-//var snapshotCatchUpEntriesN uint64 = 10000
-var snapshotCatchUpEntriesN uint64 = 10
+var snapshotCatchUpEntriesN uint64 = 10000
 
 func (rc *raftNode) maybeTriggerSnapshot() {
 	if rc.appliedIndex-rc.snapshotIndex <= rc.snapCount {
@@ -437,16 +428,13 @@ func (rc *raftNode) serveChannels() {
 
 		// store raft entries to wal, then publish over commit channel
 		case rd := <-rc.node.Ready():
-			//log.Printf("<-- rc.node.Ready(): %v --->", rd)
 			rc.wal.Save(rd.HardState, rd.Entries)
 			if !raft.IsEmptySnap(rd.Snapshot) {
 				rc.saveSnap(rd.Snapshot)
 				rc.raftStorage.ApplySnapshot(rd.Snapshot)
 				rc.publishSnapshot(rd.Snapshot)
-				log.Printf("<-- publishing a snapshot --->", rd)
 			}
 			rc.raftStorage.Append(rd.Entries)
-			// --> who did you send?
 			rc.transport.Send(rd.Messages)
 			if ok := rc.publishEntries(rc.entriesToApply(rd.CommittedEntries)); !ok {
 				rc.stop()
