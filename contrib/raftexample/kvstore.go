@@ -65,7 +65,9 @@ func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
 			// done replaying log; new data incoming
 			// OR signaled to load snapshot
 			snapshot, err := s.snapshotter.Load()
+			log.Printf("---> readCommits()  read nil <---")
 			if err == snap.ErrNoSnapshot {
+				log.Printf("---> Well, no snapshot found <---")
 				continue
 			}
 			if err != nil {
