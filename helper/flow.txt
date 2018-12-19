@@ -118,4 +118,4 @@ func (rc *raftNode)raftNode.replayWAL()  *wal.WAL
 |- rc.raftStorage.ApplySnapshot (*snapshot) if snapshot != nil   // 回放快照? 不，它只是更新了一些metadata，实际snapshot的加载还是应用状态机做的，见Kvstore.readCommits()
 |- rc.raftStorage.SetHartState (st)                              // 设置状态
 |- rc.raftStorage.Append (ents)                                  // 回放wal日志
-|- rc.lastIndex = ents[len(ents)-1].Index in len(ents) > 0 else rc.commitC <- nil // send nil once lastIndex is published so client knows commit channel is current
+|- rc.lastIndex = ents[len(ents)-1].Index in len(ents) > 0 else rc.commitC <- nil // send nil once lastIndex is published so client knows commit channel is current, 在首次启动的时候触发.

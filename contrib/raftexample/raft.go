@@ -71,7 +71,8 @@ type raftNode struct {
 	httpdonec chan struct{} // signals http server shutdown complete
 }
 
-var defaultSnapshotCount uint64 = 10000
+//var defaultSnapshotCount uint64 = 10000
+var defaultSnapshotCount uint64 = 10
 
 // newRaftNode initiates a raft instance and returns a committed log entry
 // channel and error channel. Proposals for log updates are sent over the
