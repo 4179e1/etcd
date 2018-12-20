@@ -9,17 +9,22 @@ https://work.tinou.com/2012/09/write-ahead-log.html
 The WAL looks like (not exactly, I believe something were obmitted)
  ./etcd-dump-logs ./
 Snapshot:
-empty
+term=2 index=10 nodes=[1 2 3]
 Start dupmping log entries from snapshot.
 WAL metadata:
-nodeID=0 clusterID=0 term=6 commitIndex=4 vote=1
+nodeID=0 clusterID=0 term=3 commitIndex=15 vote=3
 WAL entries:
-lastIndex=9
+lastIndex=17
 term	     index	type	data
-   1	         1	conf	method=ConfChangeAddNode id=1
-   1	         2	conf	method=ConfChangeAddNode id=2
-   1	         3	conf	method=ConfChangeAddNode id=3
-   2	         4	norm	
+   2	        11	norm	???
+   2	        12	norm	???
+   2	        13	norm	???
+   2	        14	norm	???
+   2	        15	norm	???
+   2	        16	norm	???
+   3	        17	norm	
+
+Entry types () count is : 7
 
 
 - wal/walpb/record.pb.go
@@ -120,6 +125,31 @@ func Create (lg *zap.Logger, dirpath string, metadata []byte) (*WAL, error)
 |- //That's open parent dir, fsync, close
 
 
+首个wal结构
+prevCrc
+metadata
+snapshot(空的) 
+...
+
+
+后续wal结构
+prevCrc
+metadata
+hardstate
+...
+
+之后每次Save()写入
+entries
+hardstate
+
+
+wal中的snapshot用来定位哪些walentry需要加载
+原理是
+1 - 找到一个snapshot（如果有的话），让应用加载
+2 - snapshot中包含最后的index，如果snapshot为空则index为0
+3 - 根据这个index找到哪些wal文件需要加载 (wal.start.Index)
+4 - wal.ReadAll()中只有e.Index > w.start.Index的entry才会被加载
+
 // Open opens the WAL at the given snap.
 // The snap SHOULD have been previously saved to the WAL, or the following
 // ReadAll will fail.
@@ -161,10 +191,8 @@ func (w *WAL) Save (st raftpb.HardState, ents []raftpb.Entry) error
 func (w *WAL) ReadAll() (metadata []byte, state raftpb.HardState, ents []raftpb.Entry, err error)
 |- TODO too complicate, don't understand
 |- for loop {} // keep update wal state, and crc check
-|  - ents.append (e), w.enti = e.Index
+|  - ents.append (e), w.enti = e.Index if e.Index > w.start.Index // !!!! 只会加载snapshot后面的wal entry
 |  - find latest state, metadata, snapshot
-
-
 
 - wal/file_pipeline.go
 type filePipeline struct {
