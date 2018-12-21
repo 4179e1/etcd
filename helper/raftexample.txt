@@ -24,25 +24,34 @@ main()
 |  |  |  |- rc.raftStorage.SetHartState (st)                              // 设置状态
 |  |  |  |- rc.raftStorage.Append (ents)                                  // 回放wal日志
 |  |  |  |- rc.commitC <- nil // send nil so client knows commit channel is current, 通知应用层去加载快照
-|  |  |  |- c := &raft.Config {rc.raftStorage}
-|  |  |  |- rc.node = raft.RestartNode (c) if oldwal else raft.StartNode (c, peers) // 如果是重启，其余节点的信息已经在wal中
-|  |  |  |- TODO ...
+|  |  |- c := &raft.Config {rc.raftStorage}
+|  |  |- rc.node = raft.RestartNode (c) if oldwal else raft.StartNode (c, peers) // 如果是重启，其余节点的信息已经在wal中
+|  |  |- rc.transport = &rafthttp.Transport {}  // TODO
+|  |  |- rc.transport.Start()       //TODO
+|  |  |- rc.transport.AddPeer(rc.peers) //TODO
+|  |  |- go rc.serverRaft() //TODO
+|  |  |- go rc.serverChannels() //TODO
 |  |- return commitC, errorC, rc.snapshotterReady
 |- commitC, errorC, snapshotterready := newRaftNode(..., getSnapshot, proposeC, configChangeC) // commitC 把请求提交到状态及，errorC返回错误
 |- kvs = newKVStore (<-snapshotterReady, proposeC, commitC, errorC) // 创建应用层的kvstore状态机
 |- serverHttpKVAPI (kvs, *kvport, confChangeC, errorC) //启动监听端口
 
-func (rc *raftNode)raftNode.replayWAL()  *wal.WAL 
-|-snapshot ：= raftNode.loadSnapshot()       - 从snap文件中找到最后一个并加载（如果有的话），里面记录了term和index
+
+rc.wal = rc.replayWAL()
+|- snapshot ：= raftNode.loadSnapshot()       - 从snap文件中找到最后一个并加载（如果有的话），里面记录了term和index
+|  |- rc.snapshotter.Load()     // 见snapshotter.txt
 |- w := raftNode.openWAL(snapshot)           
-| |-wal.Create (rc.waldir) if ! wal.Exit(rc.waldir) 如果不存在WAL目录/文件则创建，wal文件名为<seq>-<index>.wal
-| |-wal.Open(sanpshot)          找到最后一个index <= snapshot.index的wal并打开，注意wal.decoder会一直加载后续的wal文件，直到EOF
-|- _, st, ents, err := w.ReadAll()                     读取所有日志，真正开始读取WAL
+|  |- wal.Create (rc.waldir) if ! wal.Exit(rc.waldir) // 如果不存在WAL目录/文件则创建，wal文件名为<seq>-<index>.wal
+|  |- walsnap 从snapshot 复制 Metadata.Index , Metadata.Term  if snapshot
+|  |- w := wal.Open(walsnap)          // 找到最后一个index <= snapshot.index的wal并打开，注意wal.decoder会一直加载后续的wal文件，直到EOF
+|  |- return w
+|- _, st, ents, err := w.ReadAll()     // 读取所有日志，真正开始读取WAL TODO: 参考etcd-dump-logs
 |- rc.raftStorage = raft.NewMemoryStorage()            //新建raft存储，状态机？
 |- rc.raftStorage.ApplySnapshot (*snapshot) if snapshot != nil   // 回放快照? 不，它只是更新了一些metadata，实际snapshot的加载还是应用状态机做的，见Kvstore.readCommits()
 |- rc.raftStorage.SetHartState (st)                              // 设置状态
 |- rc.raftStorage.Append (ents)                                  // 回放wal日志
-|- rc.lastIndex = ents[len(ents)-1].Index in len(ents) > 0 else rc.commitC <- nil // send nil once lastIndex is published so client knows commit channel is current, 在首次启动的时候触发.
+|- rc.commitC <- nil // send nil so client knows commit channel is current, 通知应用层去加载快照
+
 
 func (rc *raftNode) maybeTriggerSnapshot() 
 |- return if rc.appliedIndex - rc.snapshotIndex <= rc.snapCount //如果applied index和上一次snapshot的Index之间的条数少于snapCount则跳过snapshot的创建

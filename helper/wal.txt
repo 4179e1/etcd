@@ -259,9 +259,12 @@ func (d *decoder) decode (rec *walpb.Record)
 |  |- l := readInt64(d.brs[0]) // read record length
 |  |- recBytes, padBytes := decodeFrameSize (l) //recBytes: lower 56 bits, paBytes 
 |  |- data := make([]byte, recBytes + padBytes)
-|  |- io.readFull (d.brs[0], data)
+|  |- io.readFull (d.brs[0], data) //  读取data长度的数据
 |  |- rec.UnMarshal (data[:recBytes]) // check if isTornEntry()
 |  |- isTornEntry (data)
 |  |  |- slice data into minSectorSize Chunks, if any data for a sector chunk is all 0, it's a torn write
 |  |  |- I get the idea, but how does this happen?
 |  |- d.lastValidOff += frameSizeBytes + recBytes + padBytes
+
+so what is a torn write?
+http://www.joshodgers.com/tag/torn-write/
