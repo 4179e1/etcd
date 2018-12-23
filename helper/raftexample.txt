@@ -2,6 +2,7 @@ main()
 |- make proposeC                           // 提交数据的管道
 |- make confChangeC                        // 提交配置变更的管道
 |- getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }  //创建快照的闭包
+|- commitC, errorC, snapshotterready := newRaftNode(..., getSnapshot, proposeC, configChangeC) // commitC 把请求提交到状态及，errorC返回错误
 |  |- make commitC
 |  |- make errorC
 |  |- rc := &raftNode{...commitC, errorC, rc.snapshotterReady...}.
@@ -26,13 +27,144 @@ main()
 |  |  |  |- rc.commitC <- nil // send nil so client knows commit channel is current, 通知应用层去加载快照
 |  |  |- c := &raft.Config {rc.raftStorage}
 |  |  |- rc.node = raft.RestartNode (c) if oldwal else raft.StartNode (c, peers) // 如果是重启，其余节点的信息已经在wal中
-|  |  |- rc.transport = &rafthttp.Transport {}  // TODO
-|  |  |- rc.transport.Start()       //TODO
-|  |  |- rc.transport.AddPeer(rc.peers) //TODO
+|  |  |- rc.transport = &rafthttp.Transport {..., Raft:rc, stat.NewServerStatus("", ""), stats.NewLeaderStats(rc.id)...}  // TODO
+|  |  |- rc.transport.Start()       // I don't understand the network part at all...
+|  |  |  |- t.streamRt = newStreamRoundTrippe (tls, timeout)
+|  |  |  |  |- transport.NewTimeoutTransport (tls, dimetout, readtimeout:5 , writetimeout:5)
+|  |  |  |  |  |- tr := NewTransport (tls, timeout)
+|  |  |  |  |  |  |- cfg ;= tls.ClientConfig()
+|  |  |  |  |  |  |- t := &http.Transport{... Dial: {timeout}, TLSClientConfig: cfg, ...}
+|  |  |  |  |  |  |- tu := &httpTranasport{} // hmm?
+|  |  |  |  |  |  |- ut := &unixTransport {tu}
+|  |  |  |  |  |  |- t.RegisterProtocol ("unix", ut)
+|  |  |  |  |  |  |- t.RegisterProtocol ("unixs", ut)
+|  |  |  |  |  |- update tr.MaxIdleConnsPerHost
+|  |  |  |  |  |- tr.Dial = rwTimeoutDoutDialer {Dialer: {timeout}} // override, it's a interface support tiemout
+|  |  |  |- t.pipelineRt := NewRoundTripper (tls, timeout)
+|  |  |  |  |- transport.NewTimeoutTransport (tls, dimetout, 0, 0)
+|  |  |  |  |  |-  See above
+|  |  |  |- make maps: t.repotes, t.peers
+|  |  |  |- t.pipeLineProber = probing.NewProber (t.pieplineRT) // probe conn health, statics etc.. just guessing
+|  |  |  |- t.streamProber = probing.NewProber (t.streamRT)
+|  |  |  |- update t.DialRetryFrequency
+|  |  |- rc.transport.AddPeer(id, urls) for id, urls in rc.peers//TODO
+|  |  |  |- // some checks..
+|  |  |  |- fs := t.LeaderStat.Follower (id) // the first time will init the follower with that name
+|  |  |  |- t.peers[id] = startPeer (t, urls, id as peerID, fs) //TODO
+|  |  |  |  |- status := newPeerStatus (t.ID, peerID, )
+|  |  |  |  |- picker := newURLPicker (urls)
+|  |  |  |  |- pipeline := &pipeline {peerID, t, picker, status, fs, t.Raft}
+|  |  |  |  |- pipeline.start()
+|  |  |  |  |  |- make p.stopc, p.msgc
+|  |  |  |  |  |- make p.stopc, p.msgc
+|  |  |  |  |  |- p.wg.Add(connPerPipeline)
+|  |  |  |  |  |- go p.handle() for x in seq connPerPipeline
+|  |  |  |  |  |  |- defer p.wg.Done()
+|  |  |  |  |  |  |- for loop: m := <- p.msgc
+|  |  |  |  |  |  |- err := p.post (m)
+|  |  |  |  |  |  |  |- u := p.picker.pick()
+|  |  |  |  |  |  |  |- req := createPostRequest (u, '/raft', m, 'application/protobuf', ...)
+|  |  |  |  |  |  |  |  | req := http.NewRequset ("POST", ...)
+|  |  |  |  |  |  |  |  | req.Header.Set (...)
+|  |  |  |  |  |  |  |- ctx := context.WithCancel (context.Backgroud())
+|  |  |  |  |  |  |  |- req, cancel = req.WithhContext (ctx)
+|  |  |  |  |  |  |  |- go func()  // cancel the call?
+|  |  |  |  |  |  |  |  | select {<-p.stopc: waitScuedule(), cancel(); <- done: }
+|  |  |  |  |  |  |  |- resp := ptr.piplineRt.RoundTrip (req); <- done
+|  |  |  |  |  |  |  |- b := ioutil.ReadAll(Resp.Body)
+|  |  |  |  |  |  |  |- err = checkPostResponse (resb, b, ...)
+|  |  |  |  |  |  |  |  |- ignored
+|  |  |  |  |  |  |- // ignored, updates status depends on the response
+|  |  |  |  |  |  |- // TODO
+|  |  |  |  |- // TODO 下面设置pipeline, recv channel， prop channel
+|  |  |  |  |- p := &peer {..., pipeline, snapSender: newSnapshotSender, recvc, propc...} 
+|  |  |  |  |- p.msgAppV2Writer = startStreamWriter (t.Logger, t.ID, peerID, status, fs, r t.raft)
+|  |  |  |  |  |- w := &streamWriter {status, fs, r, msgc, connc, stopc, done}
+|  |  |  |  |  |- go w.run()
+|  |  |  |  |  |  |- declare heartbeatC
+|  |  |  |  |  |  |- tickc := time.NewTicker()...
+|  |  |  |  |  |  |- for select loop
+|  |  |  |  |  |  |  - case <- heartbeatc:
+|  |  |  |  |  |  |    - err := enc.encode (&linkHeartbeatMessage) // enc were init in <-cw.connc, see below
+|  |  |  |  |  |  |    - flusher.Flush(); continue if err == nil
+|  |  |  |  |  |  |    - cw.statu.deactive()  // 标记对端deactive
+|  |  |  |  |  |  |    - cw.close()
+|  |  |  |  |  |  |    - heartbeatc, msgc = nil, nil //关闭channel
+|  |  |  |  |  |  |  - case m:= <- msgc:
+|  |  |  |  |  |  |    - err:= enc.encode (m)  // enc were init in <-cw.connc
+|  |  |  |  |  |  |    - fluster.Flush() with condition; continue if err == nil
+|  |  |  |  |  |  |    - cw.statu.deactive() 
+|  |  |  |  |  |  |    - cw.close()
+|  |  |  |  |  |  |    - heartbc, msgc = nil, nil
+|  |  |  |  |  |  |  - case conn := <-cw.connc
+|  |  |  |  |  |  |    - closed := cw.closeUnlocked()
+|  |  |  |  |  |  |      |- return if now working
+|  |  |  |  |  |  |      |- cw.closer.Close()
+|  |  |  |  |  |  |      |- cw.r.ReportUnreachable (cw.peerID) if len (cw.msg) > 0 //根据msgc长度判断对方不可达？
+|  |  |  |  |  |  |      |- make cw.msgc
+|  |  |  |  |  |  |      |- cw.working = false
+|  |  |  |  |  |  |    - enc = newMsagAppV2Encoder (w conn.Writer, cw.fs)
+|  |  |  |  |  |  |      |- &msgAppV2Encoder {w, ...}
+|  |  |  |  |  |  |    - flusher = conn.Fluster
+|  |  |  |  |  |  |    - cw.status.activate() // 标记对端active
+|  |  |  |  |  |  |    - cw.closer = conn.Closer
+|  |  |  |  |  |  |    - cw.working = true
+|  |  |  |  |  |  |  - case <- cw.stopc
+|  |  |  |  |  |  |    - cw.close() // clean 
+|  |  |  |  |- p.writer = staratStreamWriter (t.Logger, t.ID, peerId, status, fs, t.raft)
+|  |  |  |  |  |- see above
+|  |  |  |  |- p.snapSender = newSnapshotSender (tr *Transport, picker, peerid, status)
+|  |  |  |  |  |- &snapshotSender {from, to,  r}
+|  |  |  |  |- ctx := context.WithCancel (context.Background())
+|  |  |  |  |- go func()
+|  |  |  |  |  |- r.Process (ctx, mm) on mm := <- p.recvc
+|  |  |  |  |- p.msgAppV2Reader = &streamReader{...}
+|  |  |  |  |- p.msgAppReader = &streamReader{...}
+|  |  |  |  |- p.msgAppV2Reader.start()
+|  |  |  |  |  |- make cr.done
+|  |  |  |  |  |- cr.ctx, cr.cancel = context.WithCancel (context.Background())
+|  |  |  |  |  |- go cr.run()
+|  |  |  |  |  |  |- t:= cr.typ
+|  |  |  |  |  |  |- for loop
+|  |  |  |  |  |  |  - rc, err := cr.dial (t)
+|  |  |  |  |  |  |    |- TODO 
+|  |  |  |  |  |  |  - cr.status.deactivate() if err
+|  |  |  |  |  |  |  - else
+|  |  |  |  |  |  |    - cr.status.activate()
+|  |  |  |  |  |  |    - err = cr.decodeLoop (rc, t)
+|  |  |  |  |  |  |      |- dec = newMsgAppV2Decoder {rc as io.Reader}
+|  |  |  |  |  |  |      |- for loop
+|  |  |  |  |  |  |      |  - m, err := dec.decode()
+|  |  |  |  |  |  |      |  - err handler; return if err
+|  |  |  |  |  |  |      |  - // ignore heartbeat
+|  |  |  |  |  |  |      |  - recvc := cr.propc if m.Type == raftpb.MsgProp else cr.recvc
+|  |  |  |  |  |  |      |  - select:
+|  |  |  |  |  |  |      |    - case recvc <- m // ok, we recive a msg...
+|  |  |  |  |  |  |      |    - default:
+|  |  |  |  |  |  |      |      - // drop Raft msg since recv buffer is full (overloaded network)
+|  |  |  |  |  |  |    - // err happen when we reach here
+|  |  |  |  |  |  |    - switch err handler
+|  |  |  |  |  |  |      - case err == io.EOF: ingore
+|  |  |  |  |  |  |      - transport.ISCloseConnError (err): ignore, interesting, see network.txt
+|  |  |  |  |  |  |      - default: cr.status.deactivate()...
+|  |  |  |  |  |  |    - err = cr.rl.Wait (rc.ctx) // wait for a while before new dial attempt
+|  |  |  |  |  |  |    - err handler...
+|  |  |  |  |- p.msgAppReader.start()
+|  |  |  |  |  |- see above
+|  |  |  |- addPeerToProber (..., p t.pipelineProber, id, urls, "ROUND_TRIPPER_SNAPSHOT", ... )
+|  |  |  |  |- p.AddHttp (id, url) //  not exactly, but something like that
+|  |  |  |  |- s := p.Status (id) // get the status, for probing...
+|  |  |  |  |- go monitorPorbingStatus(..., s, ...)
+|  |  |  |     |- check s.Health(), s.ClockDiff() by interval
+|  |  |  |- addPeerToProber (..., p t.streamProber, id, urls, "ROUND_TRIPPER_RAFT_MESSAGE", ... )
 |  |  |- go rc.serverRaft() //TODO
+|  |  |  |- ln, err := newStoppableListerner (url.Host, rc.httpstopc)
+|  |  |  |- httpd = (&http.Server{Handler: rc.transport.Handler()})
+|  |  |  |  |- // set mux.Handle()... 
+|  |  |  |- httpd.Server (ln)  // should just block here
+|  |  |  |- select {rc.httpstop, default} // wait for err check
 |  |  |- go rc.serverChannels() //TODO
 |  |- return commitC, errorC, rc.snapshotterReady
-|- commitC, errorC, snapshotterready := newRaftNode(..., getSnapshot, proposeC, configChangeC) // commitC 把请求提交到状态及，errorC返回错误
 |- kvs = newKVStore (<-snapshotterReady, proposeC, commitC, errorC) // 创建应用层的kvstore状态机
 |- serverHttpKVAPI (kvs, *kvport, confChangeC, errorC) //启动监听端口
 
