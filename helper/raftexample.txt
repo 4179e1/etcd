@@ -164,6 +164,36 @@ main()
 |  |  |  |- httpd.Server (ln)  // should just block here
 |  |  |  |- select {rc.httpstop, default} // wait for err check
 |  |  |- go rc.serverChannels() //TODO
+|  |  |  |- snap := rc.raftStorage.Snapshot()
+|  |  |  |- rc.{confState, snapshotIndex, appliedIndex} = snap.Metadata.{...} // 更新当前状态
+|  |  |  |- defer rc.wal.Close()
+|  |  |  |- tikcer = time.NewTick (100ms); defer ticker.Stop()
+|  |  |  |  |- go func() // propose value/conf
+|  |  |  |  |  |- for select loop
+|  |  |  |  |  |  - case prop := rc.proposeC:  rc.node.Propose(context.TODO(), prop)
+|  |  |  |  |  |  - case cc := rc.confChangeC: rc.node.ProposeConfChange (context.TODO(), cc)
+|  |  |  |  |- for loop
+|  |  |  |  |  - case <-ticker.C: rc.node.Tick() // What does it do?
+|  |  |  |  |  - case rd := <- rc.node.Ready():
+|  |  |  |  |    - rc.wal.Save (rd.HardState, rd.Entries)
+|  |  |  |  |    - if rd.Snapshot 
+|  |  |  |  |      - rc.saveSnapshot (rd.Snapshot)
+|  |  |  |  |        |- TODO
+|  |  |  |  |      - rc.raftStorage.ApplySnapshot (rd.Snapshot)
+|  |  |  |  |      - rc.publishSNapshot (rd.Snapshot)
+|  |  |  |  |        |- TODO
+|  |  |  |  |    - rc.raftStorage.Append (rd.Entries)
+|  |  |  |  |    - rc.transport.Send (rd.Messages)
+|  |  |  |  |      |- TODO
+|  |  |  |  |    - entis := rc.entriesToApply (rd.CommittedEntries)
+|  |  |  |  |      |- TODO
+|  |  |  |  |    - rc.publishEntries (entis)
+|  |  |  |  |      |- TODO
+|  |  |  |  |    - rc.maybeTriggerSnapshot()
+|  |  |  |  |      |- TODO
+|  |  |  |  |    - rc.node.Advance()
+|  |  |  |  |  case err := <-rc.transport.Errorc: err return
+|  |  |  |  |  case <- rc.stopc: rc.stop() return
 |  |- return commitC, errorC, rc.snapshotterReady
 |- kvs = newKVStore (<-snapshotterReady, proposeC, commitC, errorC) // 创建应用层的kvstore状态机
 |- serverHttpKVAPI (kvs, *kvport, confChangeC, errorC) //启动监听端口
