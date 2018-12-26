@@ -177,11 +177,16 @@ main()
 |  |  |  |  |  - case rd := <- rc.node.Ready():
 |  |  |  |  |    - rc.wal.Save (rd.HardState, rd.Entries)
 |  |  |  |  |    - if rd.Snapshot 
-|  |  |  |  |      - rc.saveSnapshot (rd.Snapshot)
-|  |  |  |  |        |- TODO
+|  |  |  |  |      - rc.saveSnapshot (snap rd.Snapshot)
+|  |  |  |  |        |- walsnap.{Index, term} := snap.Metadata.{...}
+|  |  |  |  |        |- rc.wal.SaveSnapshot (snapshot) // save a snapshot entry in wal, see wal.txt
+|  |  |  |  |        |- rc.snapshotter.SaveSnap (snap) // save the snapshot as file
+|  |  |  |  |        |- rc.wal.ReleaseLockTo (snap.Metadata.index) // see code comments
 |  |  |  |  |      - rc.raftStorage.ApplySnapshot (rd.Snapshot)
-|  |  |  |  |      - rc.publishSNapshot (rd.Snapshot)
-|  |  |  |  |        |- TODO
+|  |  |  |  |      - rc.publishSNapshot (snap rd.Snapshot) // to catchup with the snapshot, any entry not yet applied should be already in the snapshot
+|  |  |  |  |        |- Fatalf if snap.Index <= rc.appliedIndex // that's essentially uncommit a committed entry
+|  |  |  |  |        |- rc.{confState, snapshotIndex, appliedindex} = snap.{...}
+|  |  |  |  |        |- rc.commitC <- nil // trigger kvstore to load
 |  |  |  |  |    - rc.raftStorage.Append (rd.Entries)
 |  |  |  |  |    - rc.transport.Send (rd.Messages)
 |  |  |  |  |      |- TODO
