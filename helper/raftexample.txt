@@ -177,7 +177,7 @@ main()
 |  |  |  |  |  - case rd := <- rc.node.Ready():
 |  |  |  |  |    - rc.wal.Save (rd.HardState, rd.Entries)
 |  |  |  |  |    - if rd.Snapshot 
-|  |  |  |  |      - rc.saveSnapshot (snap rd.Snapshot)
+|  |  |  |  |      - rc.saveSnapshot (snap rd.Snapshot) // note save wal and save file were not atomic, hence need to match the snapshot in wal.ReadAll()
 |  |  |  |  |        |- walsnap.{Index, term} := snap.Metadata.{...}
 |  |  |  |  |        |- rc.wal.SaveSnapshot (snapshot) // save a snapshot entry in wal, see wal.txt
 |  |  |  |  |        |- rc.snapshotter.SaveSnap (snap) // save the snapshot as file
