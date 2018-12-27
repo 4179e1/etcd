@@ -159,7 +159,7 @@ main()
 |  |  |  |  |- go monitorPorbingStatus(..., s, ...)
 |  |  |  |     |- check s.Health(), s.ClockDiff() by interval
 |  |  |  |- addPeerToProber (..., p t.streamProber, id, urls, "ROUND_TRIPPER_RAFT_MESSAGE", ... )
-|  |  |- go rc.serverRaft() //TODO
+|  |  |- go rc.serverRaft() //启动raftx协议的监听端口,非对外
 |  |  |  |- ln, err := newStoppableListerner (url.Host, rc.httpstopc)
 |  |  |  |- httpd = (&http.Server{Handler: rc.transport.Handler()})
 |  |  |  |  |- // set mux.Handle()... 
@@ -209,7 +209,24 @@ main()
 |  |  |  |  |  case <- rc.stopc: rc.stop() return
 |  |- return commitC, errorC, rc.snapshotterReady
 |- kvs = newKVStore (<-snapshotterReady, proposeC, commitC, errorC) // 创建应用层的kvstore状态机
+|  |- s := &kvStore {...}
+|  |- go s.readCommits (commitC, errorC)
+|  |  |- for data := range commitC:
+|  |  |  |- for data := range commitC:
+|  |  |  |  - snapshot := s.snapshotter.Load(); s.recoverFromSnapshot (snapshot.Data); continue if data == nil
+|  |  |  |  - // Decode data as dataKv
+|  |  |  |  - s.kvStore[dataKv.Key] = dataKv.val
 |- serverHttpKVAPI (kvs, *kvport, confChangeC, errorC) //启动监听端口
+|  |- srv := http.Server {kv, confChangeC}
+|  |- go srv.ListenAndServer(): //that's srv.ServerHTTP(), see below
+|  |  |- key := r.RequestURI
+|  |  |- switch r.Method
+|  |     - case "PUT":  h.store.Prose (key, v) // 提交请求
+|  |       |- store.proposeC <- kv
+|  |     - case "GET":  v := h.store.Get (key); write (v) // 获取键值
+|  |     - case "POST":  h.confChangeC <-c {raftpb.ConfChangeAddNode} //添加节点
+|  |     - case "DELETE":  h.confChangeC <-c {raftpb.ConfChangeRemoveNode} //删除节点
+|  |- err := <-errorC // wait until quit
 
 
 rc.wal = rc.replayWAL()

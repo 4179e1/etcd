@@ -1,0 +1,11 @@
+- The Go Programming Language
+- Network Programming with Go
+- Context
+- Selecting Channels
+    - closed/nil
+    - buffered/unbuffered
+    - Send / Recv
+
+- error
+  - compare predefined errors
+  - ClosedConn

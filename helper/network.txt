@@ -1,0 +1,77 @@
+- prober
+
+type Status interface {
+	Total() int64
+	Loss() int64
+	Health() bool
+	Err() error
+	// Estimated smoothed round trip time
+	SRTT() time.Duration
+	// Estimated clock difference
+	ClockDiff() time.Duration
+	StopNotify() <-chan struct{}
+}
+
+type status struct {
+	mu        sync.Mutex
+	srtt      time.Duration
+	total     int64
+	loss      int64
+	health    bool
+	err       error
+	clockdiff time.Duration
+	stopC     chan struct{}
+}
+
+type Prober interface {
+	AddHTTP(id string, probingInterval time.Duration, endpoints []string) error
+	Remove(id string) error
+	RemoveAll()
+	Reset(id string) error
+	Status(id string) (Status, error)
+}
+
+type prober struct {
+	mu      sync.Mutex
+	targets map[string]*status
+	tr      http.RoundTripper
+}
+
+- transport/listener.go
+// IsClosedConnError returns true if the error is from closing listener, cmux.
+// copied from golang.org/x/net/http2/http2.go
+func IsClosedConnError(err error) bool {
+	// 'use of closed network connection' (Go <=1.8)
+	// 'use of closed file or network connection' (Go >1.8, internal/poll.ErrClosing)
+	// 'mux: listener closed' (cmux.ErrListenerClosed)
+	return err != nil && strings.Contains(err.Error(), "closed")
+}
+
+
+- rafthttpd/transport.go
+func (t *Transport) Handler() http.Handler {
+	pipelineHandler := newPipelineHandler(t, t.Raft, t.ClusterID)
+	streamHandler := newStreamHandler(t, t, t.Raft, t.ID, t.ClusterID)
+	snapHandler := newSnapshotHandler(t, t.Raft, t.Snapshotter, t.ClusterID)
+	mux := http.NewServeMux()
+	mux.Handle('/raft', pipelineHandler)
+	mux.Handle('/raft/stream'+"/", streamHandler)
+	mux.Handle('/raft/snapshot', snapHandler)
+	mux.Handle('/raft/probing', probing.NewHandler())
+	return mux
+}
+echo of these handlers above implemented ServerHTTP method()
+func (h *pipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) 
+- set headers 
+- b := ioutil.ReadAll ()
+- var m raftpb.Message
+- m.Unmarshal (b)
+- h.r.Process (context.TODO()) // Raft.Process
+- // write response, headers...
+
+
+- raftexample/listener.go
+type stoppableListener struct {
+	*net.TCPListener
+	stopc <-chan struct{}
+}
