@@ -1,3 +1,5 @@
+see a more simple example at https://otm.github.io/2015/05/the-raft-algorithm/
+
 main()
 |- make proposeC                           // 提交数据的管道
 |- make confChangeC                        // 提交配置变更的管道
@@ -177,7 +179,7 @@ main()
 |  |  |  |  |  - case rd := <- rc.node.Ready():
 |  |  |  |  |    - rc.wal.Save (rd.HardState, rd.Entries)
 |  |  |  |  |    - if rd.Snapshot 
-|  |  |  |  |      - rc.saveSnapshot (snap rd.Snapshot) // note save wal and save file were not atomic, hence need to match the snapshot in wal.ReadAll()
+|  |  |  |  |      - rc.saveSnap (snap rd.Snapshot) // note save wal and save file were not atomic, hence need to match the snapshot in wal.ReadAll()
 |  |  |  |  |        |- walsnap.{Index, term} := snap.Metadata.{...}
 |  |  |  |  |        |- rc.wal.SaveSnapshot (snapshot) // save a snapshot entry in wal, see wal.txt
 |  |  |  |  |        |- rc.snapshotter.SaveSnap (snap) // save the snapshot as file
@@ -189,13 +191,19 @@ main()
 |  |  |  |  |        |- rc.commitC <- nil // trigger kvstore to load
 |  |  |  |  |    - rc.raftStorage.Append (rd.Entries)
 |  |  |  |  |    - rc.transport.Send (rd.Messages)
-|  |  |  |  |      |- TODO
-|  |  |  |  |    - entis := rc.entriesToApply (rd.CommittedEntries)
-|  |  |  |  |      |- TODO
+|  |  |  |  |      |- // send to rc.transport.{peer, remote}
+|  |  |  |  |    - entis := rc.entriesToApply (ents rd.CommittedEntries)
+|  |  |  |  |      |- // find the gap between applied and ents, 
+|  |  |  |  |      |- // it seems something were missing in condition check
 |  |  |  |  |    - rc.publishEntries (entis)
-|  |  |  |  |      |- TODO
+|  |  |  |  |      |- for loop: swhich ents[i].Type
+|  |  |  |  |      |  - case raftpb.EntryNormal: rc.commitC <- ents[i].Data // apply to state machine
+|  |  |  |  |      |  - case raftpb.ConfChange:
+|  |  |  |  |      |    - rc.node.ApplyConfChange (cc) // apply the conf chagne to raft node 
+|  |  |  |  |      |    - rc.transport.{AddPeer, RemovePeer}  // add / remove node depends on the context
+|  |  |  |  |      |- rc.appliedIndex = ents[i].Index // update the applied item
 |  |  |  |  |    - rc.maybeTriggerSnapshot()
-|  |  |  |  |      |- TODO
+|  |  |  |  |      |- see below
 |  |  |  |  |    - rc.node.Advance()
 |  |  |  |  |  case err := <-rc.transport.Errorc: err return
 |  |  |  |  |  case <- rc.stopc: rc.stop() return
@@ -223,7 +231,7 @@ rc.wal = rc.replayWAL()
 func (rc *raftNode) maybeTriggerSnapshot() 
 |- return if rc.appliedIndex - rc.snapshotIndex <= rc.snapCount //如果applied index和上一次snapshot的Index之间的条数少于snapCount则跳过snapshot的创建
 |- data := rc.getSnapshot()  从应用获取snapshot数据，这个函数是个closure，见main 函数里面的getSnapshot
-|- snap := rc.raftStorage.CreateSnapshot (rc.appliedIndex i , &rc.confState cs, data)
+|- snap := rc.raftStorage.CreateSnapshot (rc.appliedIndex i , &rc.confState cs, data) // update the memory storage, is that necessary?
 |  |- return ErrSnapOutOfDate if i <= ms.snapshot.Metadata.Index //快照过期
 |  |- panic if i > ms.lastIndex() // 快照超出自身entry的边界
 |  |- s.snapshot.Metadata.Index = i
@@ -232,4 +240,7 @@ func (rc *raftNode) maybeTriggerSnapshot()
 |  |- ms.snapshot.Data = data   //更新快照数据
 |  |- return ms.snapshot
 |- rc.saveSnap (snap)
-|  |- TODO
+|  |- see above
+|  |- compactIndex = rc.applieIndex - snapshotCatchUpEntriesN if rc.apliedIndex > snapshotCatchUpEntries else 1
+|  |- rc.raftStorage.Compact (comactIndex) // discard all logs before compactIndex, we *HAVE* snapshot now
+|  |- rc.snapshotIndex = rc.appliedIndex
