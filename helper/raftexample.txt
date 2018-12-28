@@ -76,8 +76,14 @@ main()
 |  |  |  |  |  |  |  |- b := ioutil.ReadAll(Resp.Body)
 |  |  |  |  |  |  |  |- err = checkPostResponse (resb, b, ...)
 |  |  |  |  |  |  |  |  |- ignored
-|  |  |  |  |  |  |- // ignored, updates status depends on the response
-|  |  |  |  |  |  |- // TODO
+|  |  |  |  |  |  |- if err
+|  |  |  |  |  |  |  - p.status.deactivate ()
+|  |  |  |  |  |  |  - p.flollowrStat.Fail() if m.Type == raftpb.MsgApp && p.followerStats // what does it do? 更新统计数据
+|  |  |  |  |  |  |  - p.raft.ReportSnapshot (m.To, raft.SnapshotFailure) if isMsgSnap (m)  // Important !!!
+|  |  |  |  |  |  |  - continue
+|  |  |  |  |  |  |- p.status.activate()
+|  |  |  |  |  |  |- p.flollowrStat.Succ() if m.Type == raftpb.MsgApp && p.followerStats // what does it do?
+|  |  |  |  |  |  |- p.raft.ReportSnapshot (m.To, raft.SnapshotFinish) if isMsgSnap (m)  // Important !!!
 |  |  |  |  |- // TODO 下面设置pipeline, recv channel， prop channel
 |  |  |  |  |- p := &peer {..., pipeline, snapSender: newSnapshotSender, recvc, propc...} 
 |  |  |  |  |- p.msgAppV2Writer = startStreamWriter (t.Logger, t.ID, peerID, status, fs, r t.raft)
@@ -191,7 +197,10 @@ main()
 |  |  |  |  |        |- rc.commitC <- nil // trigger kvstore to load
 |  |  |  |  |    - rc.raftStorage.Append (rd.Entries)
 |  |  |  |  |    - rc.transport.Send (rd.Messages)
-|  |  |  |  |      |- // send to rc.transport.{peer, remote}
+|  |  |  |  |      |- peers[to].send(m)
+|  |  |  |  |      |  |- TODO
+|  |  |  |  |      |- remotes[to].send(m)
+|  |  |  |  |      |  |- g.pipeline.msgc <- m // here we send the msg
 |  |  |  |  |    - entis := rc.entriesToApply (ents rd.CommittedEntries)
 |  |  |  |  |      |- // find the gap between applied and ents, 
 |  |  |  |  |      |- // it seems something were missing in condition check
