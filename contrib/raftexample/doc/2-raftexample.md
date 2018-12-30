@@ -1,4 +1,4 @@
-#Etcd raftexample概览
+# Etcd raftexample概览
 
 ## Etcd raftexample 简介
 
@@ -18,7 +18,7 @@ Github上有人针对这些问题提过issue：
 - [raftexample may never serve http request after loading snapshots](https://github.com/etcd-io/etcd/issues/10118)
 - [raftexample: restore or overwrite kvstore after replaying has done?](https://github.com/etcd-io/etcd/issues/9263)
 
-我原想着fix这几个问题，但是苦于很多细节自己都没弄明白，然后发现有人提了一个[patch contrib/raftexample: fix backend storage loading from a snapshot](https://github.com/etcd-io/etcd/pull/9918) ，地址在[这里](https://github.com/4179e1/etcd/tree/19e567a1362d1c97749ea2b568040ac57c39fc29/contrib/raftexample])。
+我原想着fix这几个问题，但是苦于很多细节自己都没弄明白，然后发现有人提了一个[patch contrib/raftexample: fix backend storage loading from a snapshot](https://github.com/etcd-io/etcd/pull/9918) ，一看作者是Yandex的毛子，感觉靠谱，把补丁拿下来打上再运行，符合预期，perfect。因此后文的分析都基于这个打过patch的版本，地址在[这里](https://github.com/4179e1/etcd/tree/19e567a1362d1c97749ea2b568040ac57c39fc29/contrib/raftexample])。
 
 冷知识 – 如何在git上下载一个patch文件？在Pull Request的链接上加上.patch，如上文的 [https://github.com/etcd-io/etcd/pull/9918.patch]
 
@@ -36,7 +36,7 @@ func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <
 ```
 
 打完补丁后就顺眼很多了
-```
+```go
 func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <-chan *string, errorC <-chan error) *kvstore {
 	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string), snapshotter: snapshotter}
 	// read commits from raft into kvStore map until error
