@@ -59,6 +59,121 @@ func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <
 ## Key Value Store
 这个Key Value Store 本质上是一个Key Value的map，其中保存了所有已经commit的KV，它衔接了REST Server 和 raft server。(从REST server来的）请求Key Value update请求会经过这个store，然后发送到raft server。当raft server报告一个KV已经提交的时候，它更新自己的map。
 
+数据结构很简单, 核心就是kvstore，kv用于序列化/反序列化
+
+```go
+// a key-value store backed by raft
+type kvstore struct {
+	proposeC    chan<- string // channel for proposing updates
+	mu          sync.RWMutex
+	kvStore     map[string]string // current committed key-value pairs
+	snapshotter *snap.Snapshotter // 快照相关的对象
+}
+
+type kv struct {
+	Key string
+	Val string
+}
+```
+newKVStore 返回一个新的kvsotre，需要传入四个参数
+- snapshotter复杂保存和加载快照， 后续文章会详细介绍这个对象
+- procposeC 用来提交请求，后续文章会详细描述其数据流向
+- commitC 用来接受（来自raft server的)committed的请求，后续文章会详细描述其数据流向
+- errorC 当收到错误时退出
+```go
+func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <-chan *string, errorC <-chan error) *kvstore {
+	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string), snapshotter: snapshotter}
+	// read commits from raft into kvStore map until error
+	go s.readCommits(commitC, errorC)
+	return s
+}
+```
+
+kvstore的核心循环时readCommits，它一直读取commitC的内容并处理，可能独到的值有两种
+- 一种是nil，表示WAL已经读取完（还没回放），指示加载快照
+- 二是实际的KV键值对，用于更新map
+
+这个函数是这样调用的
+- 启动时当WAL读取完之后，raft server会写往commitC 写入nil，kvstore尝试寻找有无可用的快照，有的话从快照恢复map 数据
+- raft server继续王commitC写入WAL中需要回放的数据，kvstore按照同样的顺序读取和更新map
+- 后续来自客户端的请求会经由REST API发到kvstore proposeC，当raft server达成共识提交后继续写入commitC ,当然raft Server在回复共识协议之前会先写WAL
+```go
+func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
+	for data := range commitC {
+		if data == nil {
+			// done replaying log; new data incoming
+			// OR signaled to load snapshot
+			snapshot, err := s.snapshotter.Load() // 这里会找到*最后*一个快照，如果有的话
+			if err == snap.ErrNoSnapshot {
+				continue
+			}
+			if err != nil {
+				log.Panic(err)
+			}
+            log.Printf("loading snapshot at term %d and index %d", snapshot.Metadata.Term, snapshot.Metadata.Index)
+            // 从快照恢复
+			if err := s.recoverFromSnapshot(snapshot.Data); err != nil {
+				log.Panic(err)
+			}
+			continue
+		}
+
+        // 如果不是nil，则收到一个KV键值对的更新，反序列化后直接更新到map中
+		var dataKv kv
+		dec := gob.NewDecoder(bytes.NewBufferString(*data))
+		if err := dec.Decode(&dataKv); err != nil {
+		}
+		s.mu.Lock()
+		s.kvStore[dataKv.Key] = dataKv.Val
+		s.mu.Unlock()
+	}
+	if err, ok := <-errorC; ok {
+		log.Fatal(err)
+	}
+}
+```
+
+Key Value Store快照数据的创建和恢复非常简单，直接使用JSON
+```go
+// 创建快照数据， TODO; 如何持久话
+func (s *kvstore) getSnapshot() ([]byte, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return json.Marshal(s.kvStore)
+}
+
+func (s *kvstore) recoverFromSnapshot(snapshot []byte) error {
+	var store map[string]string
+	if err := json.Unmarshal(snapshot, &store); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.kvStore = store
+	s.mu.Unlock()
+	return nil
+}
+```
+
+Key Value的查找和更新同样简单：
+```go
+func (s *kvstore) Lookup(key string) (string, bool) {
+	s.mu.RLock()
+	v, ok := s.kvStore[key]
+	s.mu.RUnlock()
+	return v, ok
+}
+
+// gob 序列化后提交到proposeC
+func (s *kvstore) Propose(k string, v string) {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(kv{k, v}); err != nil {
+		log.Fatal(err)
+	}
+	s.proposeC <- buf.String()
+}
+```
+
+
 ## REST Server
 REST Server是对外的接口，GET请求返回Key Value Store中的键值，PUT请求新建/更新KV键值对。
 
