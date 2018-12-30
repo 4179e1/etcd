@@ -4,7 +4,7 @@
 
 Raft是一个分布式一致性协议。简单的说，就是一个集群里面的所有节点都维护一个复制状态及（Replicated State Machine），要求这个状态机对于每一个给定的输入，总是产生相同的输出；这样，如果所有节点都以相同的顺序执行相同的输入，最终所有节点都会得到相同的输出。Raft协议接收来自不同客户端的请求，以相同的顺序把这些请求存储到所有节点上。每一个请求都以log的形式持久化到磁盘中，当大多数节点都存储了一条log之后，就把这个log提交到状态机执行（这个说法不严谨，需要一个额外的限制来绕过一个corner case）。
 
-![Replicated Log](p1/rsm.png)
+![Replicated Log](https://github.com/4179e1/etcd/raw/master/contrib/raftexample/doc/pic/rsm.png)
 
 ## Raft和Multi Paxos
 
@@ -27,4 +27,3 @@ Raft的实现很多，其中Golang的实现主要是两个
   - Raft的原始论文
 - [CONSENSUS: BRIDGING THEORY AND PRACTICE](https://ramcloud.stanford.edu/~ongaro/thesis.pdf)
   - Raft 作者Diego的博士论文，比上文更详细
-
