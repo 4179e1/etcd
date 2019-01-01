@@ -57,6 +57,7 @@ func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <
 下面来逐一介绍Raftexample的三个组件
 
 ## Key Value Store
+
 这个Key Value Store 本质上是一个Key Value的map，其中保存了所有已经commit的KV，它衔接了REST Server 和 raft server。(从REST server来的）请求Key Value update请求会经过这个store，然后发送到raft server。当raft server报告一个KV已经提交的时候，它更新自己的map。
 
 数据结构很简单, 核心就是kvstore，kv用于序列化/反序列化
@@ -75,11 +76,14 @@ type kv struct {
 	Val string
 }
 ```
+
 newKVStore 返回一个新的kvsotre，需要传入四个参数
+
 - snapshotter复杂保存和加载快照， 后续文章会详细介绍这个对象
 - procposeC 用来提交请求，后续文章会详细描述其数据流向
 - commitC 用来接受（来自raft server的)committed的请求，后续文章会详细描述其数据流向
 - errorC 当收到错误时退出
+
 ```go
 func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <-chan *string, errorC <-chan error) *kvstore {
 	s := &kvstore{proposeC: proposeC, kvStore: make(map[string]string), snapshotter: snapshotter}
@@ -89,14 +93,17 @@ func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <
 }
 ```
 
-kvstore的核心循环时readCommits，它一直读取commitC的内容并处理，可能独到的值有两种
+kvstore的核心循环时readCommits，它一直读取commitC的内容并处理，可能读到的值有两种
+
 - 一种是nil，表示WAL已经读取完（还没回放），指示加载快照
 - 二是实际的KV键值对，用于更新map
 
 这个函数是这样调用的
+
 - 启动时当WAL读取完之后，raft server会写往commitC 写入nil，kvstore尝试寻找有无可用的快照，有的话从快照恢复map 数据
 - raft server继续王commitC写入WAL中需要回放的数据，kvstore按照同样的顺序读取和更新map
 - 后续来自客户端的请求会经由REST API发到kvstore proposeC，当raft server达成共识提交后继续写入commitC ,当然raft Server在回复共识协议之前会先写WAL
+
 ```go
 func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
 	for data := range commitC {
@@ -135,7 +142,7 @@ func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
 
 Key Value Store快照数据的创建和恢复非常简单，直接使用JSON
 ```go
-// 创建快照数据， TODO; 如何持久话
+// 创建快照数据， TODO; 如何持久化
 func (s *kvstore) getSnapshot() ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -175,9 +182,89 @@ func (s *kvstore) Propose(k string, v string) {
 
 
 ## REST Server
-REST Server是对外的接口，GET请求返回Key Value Store中的键值，PUT请求新建/更新KV键值对。
+
+REST Server是对外的接口：
+
+ - GET请求返回Key Value Store中的键值
+ - PUT请求新建/更新KV键值对
+ - POST请求添加一个节点
+ - DELETE请求删除
+
+REST Server的httpKVAPI类型实现了Handler接口（见后文），并使用这个Handler创建了一个httpServer,当客户端请求进来的时候，ListenAndServer()会调用Handler的ServeHTTP()，根据请求的类型执行不同的操作。 
+
+```go
+// Handler for a http based key-value store backed by raft
+type httpKVAPI struct {
+	store       *kvstore
+	confChangeC chan<- raftpb.ConfChange
+}
+
+// serveHttpKVAPI starts a key-value server with a GET/PUT API and listens.
+func serveHttpKVAPI(kv *kvstore, port int, confChangeC chan<- raftpb.ConfChange, errorC <-chan error) {
+	srv := http.Server{
+		Addr: ":" + strconv.Itoa(port),
+		Handler: &httpKVAPI{
+			store:       kv,
+			confChangeC: confChangeC,
+		},
+	}
+	go func() {
+		if err := srv.ListenAndServe(); err != nil {
+			log.Fatal(err)
+		}
+	}()
+
+	// exit when raft goes down
+	if err, ok := <-errorC; ok {
+		log.Fatal(err)
+	}
+}
+```
+
+
+Handler接口的定义：
+
+```go
+type Handler interface {
+        ServeHTTP(ResponseWriter, *Request)
+}
+```
+
+具体的实现摘录如下，其中[引用的链接](https://www.alexedwards.net/blog/a-recap-of-request-handling)解释了http框架如何工作的：
+
+```go
+// PUT : propose a key
+// GET : get a key
+// POST: config change, add a node
+// DELETE: config change, delete a node
+// see go http framework here: https://www.alexedwards.net/blog/a-recap-of-request-handling
+
+func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// --> here's the key
+	key := r.RequestURI
+	switch {
+	case r.Method == "PUT":
+		v, err := ioutil.ReadAll(r.Body)
+		if err != nil {
+			log.Printf("Failed to read on PUT (%v)\n", err)
+			http.Error(w, "Failed on PUT", http.StatusBadRequest)
+			return
+		}
+
+		h.store.Propose(key, string(v))
+
+		// Optimistic-- no waiting for ack from raft. Value is not yet
+		// committed so a subsequent GET on the key may return old value
+		w.WriteHeader(http.StatusNoContent)
+	case r.Method == "GET":
+// ...cut here
+}
+```
+
+
 
 ## Raft Server
+
 Raft server是这里的一致性模块，当REST Server（经由Key Value Store）提交一个请求的时候，Raft server把这个请求发送到所有peer。当raft 协议达成共识（多数节点commit了这个请求）的时候，raft server 把所有已经commit的请求发布到一个commited channel，Key Value Store通过读取这个channel 更新自己的值。
 
 注意一点，当raft协议返回一个成功的请求时，我们说这个请求是*committed*，当Key Value Store把这个请求写入自己的map时，我们说这个请求时*applied*。
