@@ -265,6 +265,30 @@ func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 在进入Raft Server之前，我们先来看看raftexample的main函数，理清这几个组件的关系
 
+```go
+func main() {
+	cluster := flag.String("cluster", "http://127.0.0.1:9021", "comma separated cluster peers")
+	id := flag.Int("id", 1, "node ID")
+	kvport := flag.Int("port", 9121, "key-value server port")
+	join := flag.Bool("join", false, "join an existing cluster")
+	flag.Parse()
+
+	proposeC := make(chan string)
+	defer close(proposeC)
+	confChangeC := make(chan raftpb.ConfChange)
+	defer close(confChangeC)
+
+	// raft provides a commit stream for the proposals from the http api
+	var kvs *kvstore
+	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
+	commitC, errorC, snapshotterReady := newRaftNode(*id, strings.Split(*cluster, ","), *join, getSnapshot, proposeC, confChangeC)
+
+	kvs = newKVStore(<-snapshotterReady, proposeC, commitC, errorC)
+
+	// the key-value http handler will propose updates to raft
+	serveHttpKVAPI(kvs, *kvport, confChangeC, errorC)
+}
+```
 - 首先解析命令行参数，获取集群的配置信息，像是这样`./raftexample --id 1 --cluster http://127.0.0.1:12379,http://127.0.0.1:22379,http://127.0.0.1:32379 --port 12380`,其中包括
   - 逗号分割的集群节点信息，用于Raft协议内部通讯
   - 本节点id
@@ -292,31 +316,6 @@ func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
   - commitC 和 errorC 是`newRaftNode()`返回的
 - 最后`serveHtpKVAPI`启动对客户端的接口，见上文
 
-```go
-func main() {
-	cluster := flag.String("cluster", "http://127.0.0.1:9021", "comma separated cluster peers")
-	id := flag.Int("id", 1, "node ID")
-	kvport := flag.Int("port", 9121, "key-value server port")
-	join := flag.Bool("join", false, "join an existing cluster")
-	flag.Parse()
-
-	proposeC := make(chan string)
-	defer close(proposeC)
-	confChangeC := make(chan raftpb.ConfChange)
-	defer close(confChangeC)
-
-	// raft provides a commit stream for the proposals from the http api
-	var kvs *kvstore
-	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
-	commitC, errorC, snapshotterReady := newRaftNode(*id, strings.Split(*cluster, ","), *join, getSnapshot, proposeC, confChangeC)
-
-	kvs = newKVStore(<-snapshotterReady, proposeC, commitC, errorC)
-
-	// the key-value http handler will propose updates to raft
-	serveHttpKVAPI(kvs, *kvport, confChangeC, errorC)
-}
-```
-
 > 顺便谈谈函数形式参数和实际参数中管端 <-符号的区别
 > 
 > - 形式参数，也就是定义一个函数的时候，管道中的<-表示数据的方向，仅允许读取或写入，见<https://golang.google.cn/ref/spec#Channel_types> 
@@ -333,7 +332,7 @@ Raft server是这里的一致性模块，当REST Server（经由Key Value Store�
 注意一点，当raft协议返回一个成功的请求时，我们说这个请求是*committed*，当Key Value Store把这个请求写入自己的map时，我们说这个请求是*applied*
 
 先来看看它的数据结构，几个比较重要的字段在注释中标注出
-- 
+
 ```go
 // A key-value stream backed by raft
 type raftNode struct {
@@ -367,6 +366,136 @@ type raftNode struct {
 	httpstopc chan struct{} // signals http server to shutdown
 	httpdonec chan struct{} // signals http server shutdown complete
 }
+```
+
+`newRaftNode()`我们已经在main函数中见过，这里
+
+- 创建了作为返回值的三个管道，commitC, errorC，以及snapshotterReady
+- 初始化了大部分raftNode的成员
+- 但是核心的raft.Node, raft.MemoryStorage以及Snapshot，WAL对象都还没初始化，正如注释所说的`rest of structure populated after WAL replay`,在`rc.startRaft()`这个协程完成
+
+```go
+// newRaftNode initiates a raft instance and returns a committed log entry
+// channel and error channel. Proposals for log updates are sent over the
+// provided the proposal channel. All log entries are replayed over the
+// commit channel, followed by a nil message (to indicate the channel is
+// current), then new log entries. To shutdown, close proposeC and read errorC.
+func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, error), proposeC <-chan string,
+	confChangeC <-chan raftpb.ConfChange) (<-chan *string, <-chan error, <-chan *snap.Snapshotter) {
+
+	commitC := make(chan *string)
+	errorC := make(chan error)
+
+	rc := &raftNode{
+		proposeC:    proposeC,
+		confChangeC: confChangeC,
+		commitC:     commitC,
+		errorC:      errorC,
+		id:          id,
+		peers:       peers,
+		join:        join,
+		waldir:      fmt.Sprintf("raftexample-%d", id),
+		snapdir:     fmt.Sprintf("raftexample-%d-snap", id),
+		getSnapshot: getSnapshot,
+		snapCount:   defaultSnapshotCount,
+		stopc:       make(chan struct{}),
+		httpstopc:   make(chan struct{}),
+		httpdonec:   make(chan struct{}),
+
+		snapshotterReady: make(chan *snap.Snapshotter, 1),
+		// rest of structure populated after WAL replay
+	}
+	go rc.startRaft()
+	return commitC, errorC, rc.snapshotterReady
+}
+```
+
+来看看这个函数：
+
+1. 如果快照目录不存在则先创建，然后通过`snap.New()`创建快照对象，并写入管道让main函数继续执行`newKVStore`
+2. `oldwal := wal.Exist(rc.waldir)`判断是第一次启动还是重启，根据这个区别在后面用不同的方式启动RaftNode
+3. `rc.replayWAL()`中
+  - `snapshot ：= raftNode.loadSnapshot()`找到最后一个快照，如果有的话
+  - `w := rc.openWAL(snapshot)`根据快照的记录打开WAL，从快照后面的第一条WAL记录开始读取
+  - `_, st, ents, err := w.ReadAll()`读取WAL的内容，包括HardState（需要持久化的状态数据），以及WAL条目
+  - `rc.raftStorage = raft.NewMemoryStorage`，初始化raft存储
+  - `rc.raftStorage.ApplySnapshot(*snapshot)`加载快照状态，如果有的话，但是不加载其内容（TODO，raft 存储似乎不需要这个）
+  - `rc.raftStorage.SetHardState(st)` 回放持久化的状态
+  - `rc.raftStorage.Append(ents)` 回放WAL的记录
+  - `rc.commitC <- nil` 通知KVStore的`s.readCommits()`协程去加载快照，注意这是commitC的第一条记录，因此保证了`s.readCommits()`总是先加载快照（这里），然后才回放WAL记录（在后面的`rc.publishEntries()`中)
+4. 创建Raft
+
+> TODO快照和WAL的实现在另外一篇单独的文章中
+
+```go
+func (rc *raftNode) startRaft() {
+	if !fileutil.Exist(rc.snapdir) {
+		if err := os.Mkdir(rc.snapdir, 0750); err != nil {
+			log.Fatalf("raftexample: cannot create dir for snapshot (%v)", err)
+		}
+	}
+	rc.snapshotter = snap.New(zap.NewExample(), rc.snapdir)
+	rc.snapshotterReady <- rc.snapshotter
+
+	oldwal := wal.Exist(rc.waldir)
+	rc.wal = rc.replayWAL()
+
+	rpeers := make([]raft.Peer, len(rc.peers))
+	for i := range rpeers {
+		rpeers[i] = raft.Peer{ID: uint64(i + 1)}
+	}
+	c := &raft.Config{
+		ID:                        uint64(rc.id),
+		ElectionTick:              10,
+		HeartbeatTick:             1,
+		Storage:                   rc.raftStorage,
+		MaxSizePerMsg:             1024 * 1024,
+		MaxInflightMsgs:           256,
+		MaxUncommittedEntriesSize: 1 << 30,
+	}
+
+	if oldwal {
+		rc.node = raft.RestartNode(c)
+	} else {
+		startPeers := rpeers
+		if rc.join {
+			startPeers = nil
+		}
+		rc.node = raft.StartNode(c, startPeers)
+	}
+
+	rc.transport = &rafthttp.Transport{
+		Logger:      zap.NewExample(),
+		ID:          types.ID(rc.id),
+		ClusterID:   0x1000,
+		Raft:        rc,
+		ServerStats: stats.NewServerStats("", ""),
+		LeaderStats: stats.NewLeaderStats(strconv.Itoa(rc.id)),
+		ErrorC:      make(chan error),
+	}
+
+	rc.transport.Start()
+	for i := range rc.peers {
+		if i+1 != rc.id {
+			rc.transport.AddPeer(types.ID(i+1), []string{rc.peers[i]})
+		}
+	}
+
+	go rc.serveRaft()
+	go rc.serveChannels()
+}
+```
+
+```go
+```
+
+```go
+```
+
+```go
+```
+
+```go
 ```
 
 ```go
