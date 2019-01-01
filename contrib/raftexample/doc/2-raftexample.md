@@ -261,10 +261,116 @@ func (h *httpKVAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
+## main 函数
+
+在进入Raft Server之前，我们先来看看raftexample的main函数，理清这几个组件的关系
+
+- 首先解析命令行参数，获取集群的配置信息，像是这样`./raftexample --id 1 --cluster http://127.0.0.1:12379,http://127.0.0.1:22379,http://127.0.0.1:32379 --port 12380`,其中包括
+  - 逗号分割的集群节点信息，用于Raft协议内部通讯
+  - 本节点id
+  - 本节点对外监听的端口，用来服务客户端请求
+  - join 参数用来加入一个已经存在的集群
+- 创建两个proposeC和concChangeC两个管道
+  - proposeC用来提交客户端请求
+  - confChangeC用来添加/删除节点
+- `var kvs *kvstore`为kvstore的指针分配空间
+  - 注意这时候kvstore还没有创建，只是分配了一个指针的地址
+  - 有了指针之后，使用这个指针创建一个闭包`getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }`，用来获取kvsotre的快照。毫无疑问，如果此时就调用getSnapshot的话会panic的，等kvstore初始化后应该就ok了。还能这么玩？
+- `newRaftNode()`创建Raft节点
+  - 传入的若干参数包括
+    - 从命令行解析的集群配置参数
+    - `getSnapshot`闭包，注意kvstore目前仍未初始化
+    - procposeC和confChangeC
+  - 返回三个管道
+    - commitC  用来发布committed的值的管道，让kvstore应用到状态机中
+    - errorC  发布错误的管道，让kvsotre退出机制
+    - snapshotReady  这个管道用来获取 *snap.Snapshotter对象，这里返回管道而不是对象的原因是，`newRaftNode()`返回的时候还没有初始化这个对象
+  - 该函数内部后台会启动若干协程继续完成剩余的工作
+- `newKVStore()`正式初始化kvstore，4个参数
+  - 第一个参数是`<-snapshotterReady`，看仔细点,这不是一个管道，而是从管道里面读一个值，也就是等待`newRaftNode()`的协程写入snapshot对象之后，再读出来
+  - proposeC是main函数之前创建的
+  - commitC 和 errorC 是`newRaftNode()`返回的
+- 最后`serveHtpKVAPI`启动对客户端的接口，见上文
+
+```go
+func main() {
+	cluster := flag.String("cluster", "http://127.0.0.1:9021", "comma separated cluster peers")
+	id := flag.Int("id", 1, "node ID")
+	kvport := flag.Int("port", 9121, "key-value server port")
+	join := flag.Bool("join", false, "join an existing cluster")
+	flag.Parse()
+
+	proposeC := make(chan string)
+	defer close(proposeC)
+	confChangeC := make(chan raftpb.ConfChange)
+	defer close(confChangeC)
+
+	// raft provides a commit stream for the proposals from the http api
+	var kvs *kvstore
+	getSnapshot := func() ([]byte, error) { return kvs.getSnapshot() }
+	commitC, errorC, snapshotterReady := newRaftNode(*id, strings.Split(*cluster, ","), *join, getSnapshot, proposeC, confChangeC)
+
+	kvs = newKVStore(<-snapshotterReady, proposeC, commitC, errorC)
+
+	// the key-value http handler will propose updates to raft
+	serveHttpKVAPI(kvs, *kvport, confChangeC, errorC)
+}
+```
+
+> 顺便谈谈函数形式参数和实际参数中管端 <-符号的区别
+> 
+> - 形式参数，也就是定义一个函数的时候，管道中的<-表示数据的方向，仅允许读取或写入，见<https://golang.google.cn/ref/spec#Channel_types> 
+>   - `func func1 (ch <-chan int){...}`中ch仅用于读取
+>   - `func func2 (ch chan<- int){...}`中ch仅用于读取
+> - 实际参数，也就是调用的时候，可能没必要拿出来说，只是`func3 (<- ch)`这种写法很让人迷惑,它等同于`i := <- ch; func3(i)`
 
 
-## Raft Server
+
+## Raft Server 
 
 Raft server是这里的一致性模块，当REST Server（经由Key Value Store）提交一个请求的时候，Raft server把这个请求发送到所有peer。当raft 协议达成共识（多数节点commit了这个请求）的时候，raft server 把所有已经commit的请求发布到一个commited channel，Key Value Store通过读取这个channel 更新自己的值。
 
-注意一点，当raft协议返回一个成功的请求时，我们说这个请求是*committed*，当Key Value Store把这个请求写入自己的map时，我们说这个请求时*applied*。
+注意一点，当raft协议返回一个成功的请求时，我们说这个请求是*committed*，当Key Value Store把这个请求写入自己的map时，我们说这个请求是*applied*
+
+先来看看它的数据结构，几个比较重要的字段在注释中标注出
+- 
+```go
+// A key-value stream backed by raft
+type raftNode struct {
+	proposeC    <-chan string            // proposed messages (k,v)
+	confChangeC <-chan raftpb.ConfChange // proposed cluster config changes
+	commitC     chan<- *string           // entries committed to log (k,v)
+	errorC      chan<- error             // errors from raft session
+
+	id          int      // client ID for raft session
+	peers       []string // raft peer URLs
+	join        bool     // node is joining an existing cluster
+	waldir      string   // path to WAL directory
+	snapdir     string   // path to snapshot directory
+	getSnapshot func() ([]byte, error)
+
+	confState     raftpb.ConfState
+	snapshotIndex uint64
+	appliedIndex  uint64
+
+	// raft backing for the commit/error channel
+	node        raft.Node             //  代表Raft集群的一个节点
+	raftStorage *raft.MemoryStorage   //  etcd Raft 自带的存储接口的一个实现
+	wal         *wal.WAL              //  etcd 的 Write Ahead Log 
+
+	snapshotter      *snap.Snapshotter
+	snapshotterReady chan *snap.Snapshotter // signals when snapshotter is ready
+
+	snapCount uint64
+	transport *rafthttp.Transport
+	stopc     chan struct{} // signals proposal channel closed
+	httpstopc chan struct{} // signals http server to shutdown
+	httpdonec chan struct{} // signals http server shutdown complete
+}
+```
+
+```go
+```
+
+```go
+```
