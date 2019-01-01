@@ -414,18 +414,16 @@ func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, 
 
 1. 如果快照目录不存在则先创建，然后通过`snap.New()`创建快照对象，并写入管道让main函数继续执行`newKVStore`
 2. `oldwal := wal.Exist(rc.waldir)`判断是第一次启动还是重启，根据这个区别在后面用不同的方式启动RaftNode
-3. `rc.replayWAL()`中
-  - `snapshot ：= raftNode.loadSnapshot()`找到最后一个快照，如果有的话
-  - `w := rc.openWAL(snapshot)`根据快照的记录打开WAL，从快照后面的第一条WAL记录开始读取
-  - `_, st, ents, err := w.ReadAll()`读取WAL的内容，包括HardState（需要持久化的状态数据），以及WAL条目
-  - `rc.raftStorage = raft.NewMemoryStorage`，初始化raft存储
-  - `rc.raftStorage.ApplySnapshot(*snapshot)`加载快照状态，如果有的话，但是不加载其内容（TODO，raft 存储似乎不需要这个）
-  - `rc.raftStorage.SetHardState(st)` 回放持久化的状态
-  - `rc.raftStorage.Append(ents)` 回放WAL的记录
-  - `rc.commitC <- nil` 通知KVStore的`s.readCommits()`协程去加载快照，注意这是commitC的第一条记录，因此保证了`s.readCommits()`总是先加载快照（这里），然后才回放WAL记录（在后面的`rc.publishEntries()`中)
-4. 创建Raft
+3. `rc.replayWAL()`中读取快照和回放WAL,详细见后文
+4. 根据启动参数创建集群的初始成员`rpeers` 
+5. 创建`raft.Node`的配置参数`c := &raft.Config{...}`
+6. 根据是否首次启动(即第2步的`oldwal`)分为两个分支
+    - 如果是首次启动，则传入配置c和初始成员`rpeers`，调用`raft.StartNode (c, peers)`初始化`rc.node`
+    - 如果是重启，则只传入配置c，用`raft.RestartNode(c)`初始化`rc.node`，不需要rpeers，因为最新的集群成员信息已经保存在快照的metadata中或者WAL中(通过回放），并且跟原始成员相比可能已经发生了变化
+7. `rc.transport =&rafthttp.Transport{...}` 以及`rc.transport`分别创建和启动tcd的网络传输框架；下面的for循环中`rc.transport.AddPeer()`把所有其他成员添加到传输列表中。太复杂了需要单独一篇文章
+8. `go rc.serverRaft()` 启动raftx协议的监听端口，用于raft协议的内部通讯，见后文
+9. `go rc.serverChannels()` raft.go 真正的业务处理，在协程中监听用户请求、配置等命令
 
-> TODO快照和WAL的实现在另外一篇单独的文章中
 
 ```go
 func (rc *raftNode) startRaft() {
@@ -486,7 +484,43 @@ func (rc *raftNode) startRaft() {
 }
 ```
 
+细看刚才第3步中一笔带过的`rc.replayWAL()`
+
+- `snapshot ：= raftNode.loadSnapshot()`找到最后一个快照，如果有的话
+- `w := rc.openWAL(snapshot)`根据快照的记录打开WAL，从快照后面的第一条WAL记录开始读取
+- `_, st, ents, err := w.ReadAll()`读取WAL的内容，包括HardState（需要持久化的状态数据），以及WAL条目
+- `rc.raftStorage = raft.NewMemoryStorage`，初始化raft存储
+- `rc.raftStorage.ApplySnapshot(*snapshot)`加载快照状态，如果有的话，但是不加载其内容（TODO，raft 存储似乎不需要这个）
+- `rc.raftStorage.SetHardState(st)` 回放持久化的状态
+- `rc.raftStorage.Append(ents)` 回放WAL的记录
+- `rc.commitC <- nil` 通知KVStore的`s.readCommits()`协程去加载快照，注意这是commitC的第一条记录，因此保证了`s.readCommits()`总是先加载快照（这里），然后才回放WAL记录（在后面的`rc.publishEntries()`中)
+
+> TODO快照和WAL的具体实现在另外一篇单独的文章中
+
 ```go
+// replayWAL replays WAL entries into the raft instance.
+func (rc *raftNode) replayWAL() *wal.WAL {
+	log.Printf("replaying WAL of member %d", rc.id)
+	snapshot := rc.loadSnapshot()
+	w := rc.openWAL(snapshot)
+	_, st, ents, err := w.ReadAll()
+	if err != nil {
+		log.Fatalf("raftexample: failed to read WAL (%v)", err)
+	}
+	rc.raftStorage = raft.NewMemoryStorage()
+	if snapshot != nil {
+		rc.raftStorage.ApplySnapshot(*snapshot)
+	}
+	rc.raftStorage.SetHardState(st)
+
+	// append to storage so raft starts at the right place in log
+	rc.raftStorage.Append(ents)
+
+	// send nil so client knows commit channel is current
+	log.Printf("<--- commit nil in replayWAL(): reply done")
+	rc.commitC <- nil
+	return w
+}
 ```
 
 ```go
@@ -503,3 +537,7 @@ func (rc *raftNode) startRaft() {
 
 ```go
 ```
+
+## Reference
+
+- <https://jin-yang.github.io/post/golang-raft-etcd-example-sourcode-details.html>
