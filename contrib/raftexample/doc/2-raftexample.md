@@ -100,7 +100,7 @@ kvstore的核心循环时readCommits，它一直读取commitC的内容并处理�
 
 这个函数是这样调用的
 
-- 启动时当WAL读取完之后，raft server会写往commitC 写入nil，kvstore尝试寻找有无可用的快照，有的话从快照恢复map 数据
+- 启动时当WAL读取完之后，raft server会写往commitC 写入nil，kvstore尝试寻找有无可用的快照，有的话从快照恢复map 数据。如果我没有理解错的话，raft Server往commitC写入的第一条数据就应该是nil。
 - raft server继续王commitC写入WAL中需要回放的数据，kvstore按照同样的顺序读取和更新map
 - 后续来自客户端的请求会经由REST API发到kvstore proposeC，当raft server达成共识提交后继续写入commitC ,当然raft Server在回复共识协议之前会先写WAL
 
@@ -140,7 +140,7 @@ func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
 }
 ```
 
-Key Value Store快照数据的创建和恢复非常简单，直接使用JSON
+Key Value Store快照数据的创建和恢复非常简单，直接使用JSON序列化/反序列化
 ```go
 // 创建快照数据， TODO; 如何持久化
 func (s *kvstore) getSnapshot() ([]byte, error) {
@@ -410,7 +410,7 @@ func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, 
 }
 ```
 
-来看看这个函数：
+来看看`rc.startRaft()`这个函数，这里我们标上序号，有几个函数需要单独拎出来看：
 
 1. 如果快照目录不存在则先创建，然后通过`snap.New()`创建快照对象，并写入管道让main函数继续执行`newKVStore`
 2. `oldwal := wal.Exist(rc.waldir)`判断是第一次启动还是重启，根据这个区别在后面用不同的方式启动RaftNode
@@ -489,10 +489,10 @@ func (rc *raftNode) startRaft() {
 - `snapshot ：= raftNode.loadSnapshot()`找到最后一个快照，如果有的话
 - `w := rc.openWAL(snapshot)`根据快照的记录打开WAL，从快照后面的第一条WAL记录开始读取
 - `_, st, ents, err := w.ReadAll()`读取WAL的内容，包括HardState（需要持久化的状态数据），以及WAL条目
-- `rc.raftStorage = raft.NewMemoryStorage`，初始化raft存储
-- `rc.raftStorage.ApplySnapshot(*snapshot)`加载快照状态，如果有的话，但是不加载其内容（TODO，raft 存储似乎不需要这个）
-- `rc.raftStorage.SetHardState(st)` 回放持久化的状态
-- `rc.raftStorage.Append(ents)` 回放WAL的记录
+- `rc.raftStorage = raft.NewMemoryStorage()`，创建raft存储，然后按照etcd raft的要求的三步进行回放
+  - `rc.raftStorage.ApplySnapshot(*snapshot)`加载快照的metadata，如果有的话，但是不加载其内容（TODO，raft 存储似乎不需要这个）
+  - `rc.raftStorage.SetHardState(st)` 回放持久化的状态
+  - `rc.raftStorage.Append(ents)` 回放WAL的记录
 - `rc.commitC <- nil` 通知KVStore的`s.readCommits()`协程去加载快照，注意这是commitC的第一条记录，因此保证了`s.readCommits()`总是先加载快照（这里），然后才回放WAL记录（在后面的`rc.publishEntries()`中)
 
 > TODO快照和WAL的具体实现在另外一篇单独的文章中
@@ -523,10 +523,76 @@ func (rc *raftNode) replayWAL() *wal.WAL {
 }
 ```
 
-```go
-```
+第7步的`serveRaft()`启动raft 协议的网络监听端口，主要是两部分
+- 创建一个`stoppableListener`对象，它其实是内嵌（embed)了一个`*net.TCPListener`，因此所有能直接调用所有[net.TCPListener](https://golang.google.cn/pkg/net/#TCPListener)的方法，另外加上了一个channel让listner在`Accept()`阻塞时能退出来，这就是它叫做stoppable的原因……
+- TODO
 
 ```go
+func (rc *raftNode) serveRaft() {
+	url, err := url.Parse(rc.peers[rc.id-1])
+	if err != nil {
+		log.Fatalf("raftexample: Failed parsing URL (%v)", err)
+	}
+
+	ln, err := newStoppableListener(url.Host, rc.httpstopc)
+	if err != nil {
+		log.Fatalf("raftexample: Failed to listen rafthttp (%v)", err)
+	}
+
+	err = (&http.Server{Handler: rc.transport.Handler()}).Serve(ln)
+	select {
+	case <-rc.httpstopc:
+	default:
+		log.Fatalf("raftexample: Failed to serve rafthttp (%v)", err)
+	}
+	close(rc.httpdonec)
+}
+```
+
+下面是stoppableListener的实现，值得注意的几点
+
+- `stoppableListener`实现了自己的`Accept()`方法，覆盖了`net.TCPListener`自带的`Accept()`，这算是golang的override了吧，这种用法[参考这里](https://medium.com/random-go-tips/method-overriding-680cfd51ce40)。
+- `Accept()` 中，`ln.AcceptTCP()`运行在单独的一个协程，新建立的客户端链接通过管道传给主函数的connc，在它阻塞的期间可以写入ln.stopc让主函数返回，此时`ln.AcceptTCP()`则没有做任何处理。TODO：这里会存在什么问题吗？ 
+- 新建立的链接默认加上了TCP的KeepAlive选项
+
+```go
+// stoppableListener sets TCP keep-alive timeouts on accepted
+// connections and waits on stopc message
+type stoppableListener struct {
+	*net.TCPListener
+	stopc <-chan struct{}
+}
+
+func newStoppableListener(addr string, stopc <-chan struct{}) (*stoppableListener, error) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	return &stoppableListener{ln.(*net.TCPListener), stopc}, nil
+}
+
+func (ln stoppableListener) Accept() (c net.Conn, err error) {
+	connc := make(chan *net.TCPConn, 1)
+	errc := make(chan error, 1)
+	go func() {
+		tc, err := ln.AcceptTCP()
+		if err != nil {
+			errc <- err
+			return
+		}
+		connc <- tc
+	}()
+	select {
+	case <-ln.stopc:
+		return nil, errors.New("server stopped")
+	case err := <-errc:
+		return nil, err
+	case tc := <-connc:
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(3 * time.Minute)
+		return tc, nil
+	}
+}
 ```
 
 ```go
