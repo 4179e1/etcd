@@ -523,7 +523,7 @@ func (rc *raftNode) replayWAL() *wal.WAL {
 }
 ```
 
-第7步的`serveRaft()`启动raft 协议的网络监听端口，主要是两部分
+第8步的`serveRaft()`启动raft 协议的网络监听端口，主要是两部分
 - 创建一个`stoppableListener`对象，它其实是内嵌（embed)了一个`*net.TCPListener`，因此所有能直接调用所有[net.TCPListener](https://golang.google.cn/pkg/net/#TCPListener)的方法，另外加上了一个channel让listner在`Accept()`阻塞时能退出来，这就是它叫做stoppable的原因……
 - TODO
 
