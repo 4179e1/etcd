@@ -331,6 +331,8 @@ Raft server是这里的一致性模块，当REST Server（经由Key Value Store�
 
 注意一点，当raft协议返回一个成功的请求时，我们说这个请求是*committed*，当Key Value Store把这个请求写入自己的map时，我们说这个请求是*applied*
 
+### 数据结构
+
 先来看看它的数据结构，几个比较重要的字段在注释中标注出
 
 ```go
@@ -367,6 +369,8 @@ type raftNode struct {
 	httpdonec chan struct{} // signals http server shutdown complete
 }
 ```
+
+### 初始化
 
 `newRaftNode()`我们已经在main函数中见过，这里
 
@@ -484,6 +488,8 @@ func (rc *raftNode) startRaft() {
 }
 ```
 
+#### 回放快照和WAL
+
 细看刚才第3步中一笔带过的`rc.replayWAL()`
 
 - `snapshot ：= raftNode.loadSnapshot()`找到最后一个快照，如果有的话
@@ -517,15 +523,16 @@ func (rc *raftNode) replayWAL() *wal.WAL {
 	rc.raftStorage.Append(ents)
 
 	// send nil so client knows commit channel is current
-	log.Printf("<--- commit nil in replayWAL(): reply done")
 	rc.commitC <- nil
 	return w
 }
 ```
 
+#### 启动网络监听端口
+
 第8步的`serveRaft()`启动raft 协议的网络监听端口，主要是两部分
 - 创建一个`stoppableListener`对象，它其实是内嵌（embed)了一个`*net.TCPListener`，因此所有能直接调用所有[net.TCPListener](https://golang.google.cn/pkg/net/#TCPListener)的方法，另外加上了一个channel让listner在`Accept()`阻塞时能退出来，这就是它叫做stoppable的原因……
-- TODO
+- 创建`http.Server`，并使用刚才创建的stoppableListener监听请求
 
 ```go
 func (rc *raftNode) serveRaft() {
@@ -595,11 +602,55 @@ func (ln stoppableListener) Accept() (c net.Conn, err error) {
 }
 ```
 
-```go
-```
+`err = (&http.Server{Handler: rc.transport.Handler()}).Serve(ln)`新建了一个`http.Server`对象，其中使用了自定义的Handler`rc.transport.Handler()`，最后在这个`http.Server`对象上监听刚才创建的stoppableListener
+
+这里自定义的Handler是一个`ServeMux`对象——一个路由，它把进来的请求继续分发到不同路径对应的handler去处理。这里的`pipelineHandler`,`streamHandler`,`snapHandler`,`probing.NewHandler()`全都实现了`ServeHTTP()`方法。这一部分留到网络部分再细看。
+
 
 ```go
+func (t *Transport) Handler() http.Handler {
+	pipelineHandler := newPipelineHandler(t, t.Raft, t.ClusterID)
+	streamHandler := newStreamHandler(t, t, t.Raft, t.ID, t.ClusterID)
+	snapHandler := newSnapshotHandler(t, t.Raft, t.Snapshotter, t.ClusterID)
+	mux := http.NewServeMux()
+	mux.Handle(RaftPrefix, pipelineHandler)
+	mux.Handle(RaftStreamPrefix+"/", streamHandler)
+	mux.Handle(RaftSnapshotPrefix, snapHandler)
+	mux.Handle(ProbingPrefix, probing.NewHandler())
+	return mux
+}
 ```
+
+把常量替换一下，可以看到实际的路由如下
+
+```go
+func (t *Transport) Handler() http.Handler {
+	pipelineHandler := newPipelineHandler(t, t.Raft, t.ClusterID)
+	streamHandler := newStreamHandler(t, t, t.Raft, t.ID, t.ClusterID)
+	snapHandler := newSnapshotHandler(t, t.Raft, t.Snapshotter, t.ClusterID)
+	mux := http.NewServeMux()
+	mux.Handle("/raft", pipelineHandler)
+	mux.Handle("/raft/stream"+"/", streamHandler)
+	mux.Handle("/raft/snapshot", snapHandler)
+	mux.Handle("/raft/probing", probing.NewHandler())
+	return mux
+}
+```
+
+举例看看`probing.NewHandler()`的`ServerHTTP()`方法，就是返回一个OK和时间戳，其他三种handler留待网络部分再看.
+
+```go
+func (h *httpHealth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	health := Health{OK: true, Now: time.Now()}
+	e := json.NewEncoder(w)
+	e.Encode(health)
+}
+
+```
+
+### Raft业务处理
+
+第9步正式进行Raft协议的业务处理
 
 ```go
 ```
