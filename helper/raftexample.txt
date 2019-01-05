@@ -267,6 +267,6 @@ func (rc *raftNode) maybeTriggerSnapshot()
 |  |- return ms.snapshot
 |- rc.saveSnap (snap)
 |  |- see above
-|  |- compactIndex = rc.applieIndex - snapshotCatchUpEntriesN if rc.apliedIndex > snapshotCatchUpEntries else 1
-|  |- rc.raftStorage.Compact (comactIndex) // discard all logs before compactIndex, we *HAVE* snapshot now
-|  |- rc.snapshotIndex = rc.appliedIndex
+|- compactIndex = rc.applieIndex - snapshotCatchUpEntriesN if rc.apliedIndex > snapshotCatchUpEntries else 1
+|- rc.raftStorage.Compact (comactIndex) // discard all logs before compactIndex, we *HAVE* snapshot now
+|- rc.snapshotIndex = rc.appliedIndex

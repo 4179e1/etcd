@@ -498,11 +498,12 @@ func (rc *raftNode) startRaft() {
 - `w := rc.openWAL(snapshot)`根据快照的记录打开WAL，从快照后面的第一条WAL记录开始读取
 - `_, st, ents, err := w.ReadAll()`读取WAL的内容，包括HardState（需要持久化的状态数据），以及WAL条目
 - `rc.raftStorage = raft.NewMemoryStorage()`，创建raft存储，然后按照etcd raft的要求的三步进行回放
-  - `rc.raftStorage.ApplySnapshot(*snapshot)`加载快照的metadata，如果有的话，但是不加载其内容（TODO，raft 存储似乎不需要这个）
+  - `rc.raftStorage.ApplySnapshot(*snapshot)`加载快照的metadata，如果有的话，但是不加载其内容，raft 存储不需要这个
   - `rc.raftStorage.SetHardState(st)` 回放持久化的状态
   - `rc.raftStorage.Append(ents)` 回放WAL的记录
 - `rc.commitC <- nil` 通知KVStore的`s.readCommits()`协程去加载快照，注意这是commitC的第一条记录，因此保证了`s.readCommits()`总是先加载快照（这里），然后才回放WAL记录（在后面的`rc.publishEntries()`中)
 
+> WAL是一系列默认大小为64MB的文件，超过这个长度会进行切割，文件名为`<seq>-<index>.wal`，seq是文件的序号，index是raft协议中已经committed的index。
 > TODO快照和WAL的具体实现在另外一篇单独的文章中
 
 ```go
@@ -777,7 +778,7 @@ func (rc *raftNode) stop() {
 }
 ```
 
-最后重点看一下`serveChannel()`第二个循环`case rd := <-rc.node.Ready():`这个分支
+最后重点看一下`serveChannel()`第二个循环`case rd := <-rc.node.Ready():`这个分支，`Ready`的数据结构如下:
 
 ```go
 // Ready encapsulates the entries and messages that are ready to read,
@@ -821,6 +822,144 @@ type Ready struct {
 	// MustSync indicates whether the HardState and Entries must be synchronously
 	// written to disk or if an asynchronous write is permissible.
 	MustSync bool
+}
+```
+
+回到`serveChannels()`第二个循环的这个分支：
+
+- 首先`rc.wal.Save(rd.HardState, rd.Entries)`把硬状态和日志写到WAL中
+- 如果Ready状态中包含了快照，则直接应用这个快照，一个节点重启后可能缺了很多entry，直接用快照覆盖就完事了
+  - 执行`rc.saveSnap()`保存快照，细分为
+    - `rc.wal.SaveSnapshot(walSnap)`把快照Metadata的两项(`Metadata.Index`, 和 `Metadata.term`)保存到WAL中,Index和Term用来在重启回放快照和WAL时，确保他们的状态是一致的。这里不保存快照的内容。           
+    - `rc.snapshotter.SaveSnap(snap)`把快照实际写入快照文件，文件命名为`<snapshot.Metadata.Term>-<snapshot.Metadata.Index>.snap`
+    - `rc.wal.ReleaseLockTo(snap.Metadata.Index)`释放快照Index之前不再使用的WAL文件
+  - `rc.raftStorage.ApplySnapshot(rd.Snapshot)`把快照数据应用到Raft 存储中，
+  - `rc.publishSnapshot(rd.Snapshot)`更新结构体的结构体的`confState`， `snapshotIndex`， `appliedIndex`三个字段，然后往rc.commitC写入通知KV store加载我们刚在`rc.snapshotter.SaveSnap(snap)`保存的快照文件
+- `rc.raftStorage.Append(rd.Entries)`把日志应用到raft 存储
+- `rc.transport.Send(rd.Messages)`把消息发给peers //TODO 具体怎么发的？
+- `rc.entriesToApply(rd.CommittedEntries)`找出还没有applied的日志，这里rd.CommittedEntries的index需要小于或等于已经applied index，不然中间就缺失了一些日志，绝对不能应用到状态机里面。而冗余的则通过这个函数去除。把这些还没有applid的日志找出来以后，通过`rc.publishEntries(rc.entriesToApply(rd.CommittedEntries))`发布给kvstore，后面再看这个函数。
+- `rc.maybeTriggerSnapshot()`判断是否要作一次本地快照，后面再议。
+- `rc.node.Advance()`通知raft我们已经保存了需要的数据，可以开始发下一批数据了。
+
+```go
+		case rd := <-rc.node.Ready():
+			rc.wal.Save(rd.HardState, rd.Entries)
+			if !raft.IsEmptySnap(rd.Snapshot) {
+				rc.saveSnap(rd.Snapshot)
+				rc.raftStorage.ApplySnapshot(rd.Snapshot)
+				rc.publishSnapshot(rd.Snapshot)
+			}
+			rc.raftStorage.Append(rd.Entries)
+			rc.transport.Send(rd.Messages)
+			if ok := rc.publishEntries(rc.entriesToApply(rd.CommittedEntries)); !ok {
+				rc.stop()
+				return
+			}
+			rc.maybeTriggerSnapshot()
+			rc.node.Advance()
+```
+
+`publishEntries`把日志发送给kvstore，注意日志有两种类型：
+
+- 一是`raftpb.EntryNormal` 即客户端提交的，并由raft协议commit的请求。直接通过rc.commitC发给kvstore
+- 另一种是`raftpb.EntryConfChange`,即配置（节点）的变更
+  - 首先需要`rc.confState = *rc.node.ApplyConfChange(cc)`更新raft node的配置
+  - 然后根据是添加还是删除节点分别调用`rc.transport.AddPeer(types.ID(cc.NodeID), []string{string(cc.Context)})`或`rc.transport.RemovePeer(types.ID(cc.NodeID))`
+- 发布所有日志之后，`rc.appliedIndex = ents[i].Index`更新applied记录
+
+```go
+// publishEntries writes committed log entries to commit channel and returns
+// whether all entries could be published.
+func (rc *raftNode) publishEntries(ents []raftpb.Entry) bool {
+	for i := range ents {
+		switch ents[i].Type {
+		case raftpb.EntryNormal:
+			if len(ents[i].Data) == 0 {
+				// ignore empty messages
+				break
+			}
+			s := string(ents[i].Data)
+			select {
+			case rc.commitC <- &s:
+				log.Printf("publishEntries: %v", s)
+			case <-rc.stopc:
+				return false
+			}
+
+		case raftpb.EntryConfChange:
+			var cc raftpb.ConfChange
+			cc.Unmarshal(ents[i].Data)
+			rc.confState = *rc.node.ApplyConfChange(cc)
+			switch cc.Type {
+			case raftpb.ConfChangeAddNode:
+				log.Printf("publishEntries: ConfChangeAddNode")
+				if len(cc.Context) > 0 {
+					rc.transport.AddPeer(types.ID(cc.NodeID), []string{string(cc.Context)})
+				}
+			case raftpb.ConfChangeRemoveNode:
+				log.Printf("publishEntries: ConfChangeRemoveNode")
+				if cc.NodeID == uint64(rc.id) {
+					log.Println("I've been removed from the cluster! Shutting down.")
+					return false
+				}
+				rc.transport.RemovePeer(types.ID(cc.NodeID))
+			}
+		}
+
+		// after commit, update appliedIndex
+		rc.appliedIndex = ents[i].Index
+	}
+	return true
+}
+```
+
+每次`case rd := <-rc.node.Ready()`的分支都会判断都会看看是否需要在本地创建快照
+
+- 判断的逻辑很简单，看看上一次做快照的日志`rc.snapshotIndex`和最新一条应用的日志`rc.appliedIndex`之间差了多少条日志，如果少于`rc.snapCount`这个常量则跳过
+- `data, err := rc.getSnapshot()`拿到应用当前的快照数据
+- `snap, err := rc.raftStorage.CreateSnapshot(rc.appliedIndex-1, &rc.confState, data)`不是很明白这一步在干什么，可能只是为了创建符合raftpb.Snapshot格式的快照。虽然说了很多次快照，但是做了多层封装后，不同层面快照的数据结构都不一样，跟tcp/ip的包一层套一层似的。
+- `rc.saveSnap(snap)`把保存这个快照，这个函数前面看过
+- 好了，既然快照已经保存了，记再快照中的条目，就可以从raft 存储中`rc.raftStorage.Compact(compactIndex)`一些不再需要的数据 //TODO： compatIndex的计算没看懂.
+  - compatcIndex 要么是1，如果rc.appliedIndex <= snapshotCatchUpEntriesN的话，
+  - 要么是`compactIndex = rc.appliedIndex - snapshotCatchUpEntriesN`,如果`rc.appliedIndex > snapshotCatchUpEntriesN`的话，目前`snapshotCatchUpEntriesN`跟`rc.snapCount`这个常量的值相同
+  - 这里的意思似乎是，至少要在raft 存储中保存有一个快照`rc.snapCount`的数量的日志，也就是说这些日志在快照中有，在raft 内存存储也有，可能是处于可靠性的考虑，如果最新的快照文件出问题了，raft 存储也还有？ 其实理论上把已经在快照中的数据都丢了应该也没问题，这个函数的注释说：
+> // Compact discards all log entries prior to compactIndex.
+> // It is the application's responsibility to not attempt to compact an index
+> // greater than raftLog.applied.
+
+```go
+func (rc *raftNode) maybeTriggerSnapshot() {
+	if rc.getSnapshot == nil {
+		return
+	}
+
+	if rc.appliedIndex-rc.snapshotIndex <= rc.snapCount {
+		return
+	}
+
+	log.Printf("start snapshot [applied index: %d | last snapshot index: %d]", rc.appliedIndex, rc.snapshotIndex)
+	data, err := rc.getSnapshot()
+	if err != nil {
+		log.Panic(err)
+	}
+	snap, err := rc.raftStorage.CreateSnapshot(rc.appliedIndex-1, &rc.confState, data)
+	if err != nil {
+		panic(err)
+	}
+	if err := rc.saveSnap(snap); err != nil {
+		panic(err)
+	}
+
+	compactIndex := uint64(1)
+	if rc.appliedIndex > snapshotCatchUpEntriesN {
+		compactIndex = rc.appliedIndex - snapshotCatchUpEntriesN
+	}
+	if err := rc.raftStorage.Compact(compactIndex); err != nil {
+		panic(err)
+	}
+
+	log.Printf("compacted log at index %d", compactIndex)
+	rc.snapshotIndex = rc.appliedIndex
 }
 ```
 
