@@ -161,7 +161,9 @@ func (s *kvstore) recoverFromSnapshot(snapshot []byte) error {
 }
 ```
 
-Key Value的查找和更新同样简单：
+Key Value的查找和更新同样简单。
+> TODO 对于Propse()函数，注意它没有返回值，所以如果客户端如何确定提交是成功还是失败？
+
 ```go
 func (s *kvstore) Lookup(key string) (string, bool) {
 	s.mu.RLock()
@@ -420,7 +422,7 @@ func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, 
 2. `oldwal := wal.Exist(rc.waldir)`判断是第一次启动还是重启，根据这个区别在后面用不同的方式启动RaftNode
 3. `rc.replayWAL()`中读取快照和回放WAL,详细见后文
 4. 根据启动参数创建集群的初始成员`rpeers` 
-5. 创建`raft.Node`的配置参数`c := &raft.Config{...}`
+5. 创建`raft.Node`的配置参数`c := &raft.Config{...}`，其中有两个跟超时有关的参数，`ElectionTick`和`HeartbeatTick`，前者是后者的10倍，注意它们并没有设置单位。结合后文的`Node.Tick()`中使用了一个定时器，因此这里实际的超时时间可能是定时器超时时间 * 这两个单位。
 6. 根据是否首次启动(即第2步的`oldwal`)分为两个分支
     - 如果是首次启动，则传入配置c和初始成员`rpeers`，调用`raft.StartNode (c, peers)`初始化`rc.node`
     - 如果是重启，则只传入配置c，用`raft.RestartNode(c)`初始化`rc.node`，不需要rpeers，因为最新的集群成员信息已经保存在快照的metadata中或者WAL中(通过回放），并且跟原始成员相比可能已经发生了变化
@@ -652,7 +654,119 @@ func (h *httpHealth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 第9步正式进行Raft协议的业务处理
 
+- 首先根据快照的metadata更新结构体的`confState`， `snapshotIndex`， `appliedIndex`三个字段
+- `ticker := time.NewTicker(100 * time.Millisecond)`创建一个定时器
+- 然后是两个核心主循环
+  - 第一个主循环在一个单独的协程中，用来处理来自客户端的请求
+    - 从proposeC读取客户端的`提交`请求，然后调用`rc.node.Propose(context.TODO(), []byte(prop))`调用raft协议的提交接口，这个调用是阻塞的。
+	- 从confChangC读取`配置变更`请求，然后调用`rc.node.ProposeConfChange(context.TODO(), cc)`提交配置修改。
+	- TODO： 这两个调用都不返回结果，如果判断请求是否成功？
+	- 如果有任何一个channel被关闭 (TODO怎么关闭的，什么时候关？)，对应的channel会被置nil，当两个channel都为nil时退出循环，关闭rc.stopc通知另一个主循环退出。 [nil channel的用法参考](https://lingchao.xin/post/why-are-there-nil-channels-in-go.html)
+  - 第二个主循环读取Raft协议的更新， 4个channel对应4个分支
+    - 定时器超时的时候调用`rc.node.Tick()`，这是etcd raft实现要求的，估计是用来更新选举和心跳超时时间，用来触发对应的错误处理。
+	- `rd := <-rc.node.Ready()`返回一个Ready对象，TODO
+	- `case err := <-rc.transport.ErrorC`接收transport的错误，然后调用`rc.writeError(err)`停止transport和raft.Node，并关闭`rc.httpdonec`(这个channel好像并没有关联任何东西)
+    - `case <-rc.stopc`调用`rc.stop()`停止Raft Server
+	
 ```go
+func (rc *raftNode) serveChannels() {
+	snap, err := rc.raftStorage.Snapshot()
+	if err != nil {
+		panic(err)
+	}
+	rc.confState = snap.Metadata.ConfState
+	rc.snapshotIndex = snap.Metadata.Index
+	rc.appliedIndex = snap.Metadata.Index
+
+	defer rc.wal.Close()
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	// send proposals over raft
+	go func() {
+		confChangeCount := uint64(0)
+
+		for rc.proposeC != nil && rc.confChangeC != nil {
+			select {
+			case prop, ok := <-rc.proposeC:
+				if !ok {
+					rc.proposeC = nil
+				} else {
+					// blocks until accepted by raft state machine
+					rc.node.Propose(context.TODO(), []byte(prop))
+				}
+
+			case cc, ok := <-rc.confChangeC:
+				if !ok {
+					rc.confChangeC = nil
+				} else {
+					confChangeCount++
+					cc.ID = confChangeCount
+					rc.node.ProposeConfChange(context.TODO(), cc)
+				}
+			}
+		}
+		// client closed channel; shutdown raft if not already
+		close(rc.stopc)
+	}()
+
+	// event loop on raft state machine updates
+	for {
+		select {
+		case <-ticker.C:
+			rc.node.Tick()
+
+		// store raft entries to wal, then publish over commit channel
+		case rd := <-rc.node.Ready():
+			rc.wal.Save(rd.HardState, rd.Entries)
+			if !raft.IsEmptySnap(rd.Snapshot) {
+				rc.saveSnap(rd.Snapshot)
+				rc.raftStorage.ApplySnapshot(rd.Snapshot)
+				rc.publishSnapshot(rd.Snapshot)
+			}
+			rc.raftStorage.Append(rd.Entries)
+			rc.transport.Send(rd.Messages)
+			if ok := rc.publishEntries(rc.entriesToApply(rd.CommittedEntries)); !ok {
+				rc.stop()
+				return
+			}
+			rc.maybeTriggerSnapshot()
+			rc.node.Advance()
+
+		case err := <-rc.transport.ErrorC:
+			rc.writeError(err)
+			return
+
+		case <-rc.stopc:
+			rc.stop()
+			return
+		}
+	}
+}
+
+
+func (rc *raftNode) writeError(err error) {
+	rc.stopHTTP()
+	close(rc.commitC)
+	rc.errorC <- err
+	close(rc.errorC)
+	rc.node.Stop()
+}
+
+func (rc *raftNode) stopHTTP() {
+	rc.transport.Stop()
+	close(rc.httpstopc)
+	<-rc.httpdonec
+}
+
+// stop closes http, closes all channels, and stops raft.
+func (rc *raftNode) stop() {
+	rc.stopHTTP()
+	close(rc.commitC)
+	close(rc.errorC)
+	rc.node.Stop()
+}
 ```
 
 ## Reference
