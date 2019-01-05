@@ -659,13 +659,13 @@ func (h *httpHealth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 - 然后是两个核心主循环
   - 第一个主循环在一个单独的协程中，用来处理来自客户端的请求
     - 从proposeC读取客户端的`提交`请求，然后调用`rc.node.Propose(context.TODO(), []byte(prop))`调用raft协议的提交接口，这个调用是阻塞的。
-	- 从confChangC读取`配置变更`请求，然后调用`rc.node.ProposeConfChange(context.TODO(), cc)`提交配置修改。
-	- TODO： 这两个调用都不返回结果，如果判断请求是否成功？
-	- 如果有任何一个channel被关闭 (TODO怎么关闭的，什么时候关？)，对应的channel会被置nil，当两个channel都为nil时退出循环，关闭rc.stopc通知另一个主循环退出。 [nil channel的用法参考](https://lingchao.xin/post/why-are-there-nil-channels-in-go.html)
+    - 从confChangC读取`配置变更`请求，然后调用`rc.node.ProposeConfChange(context.TODO(), cc)`提交配置修改。
+    - TODO： 这两个调用都不返回结果，如果判断请求是否成功？  这里是否会设置context的Error？
+    - 如果有任何一个channel被关闭 (在main 函数的 defer里面，serverHttpKVAPI退出后)，对应的channel会被置nil，当两个channel都为nil时退出循环，关闭rc.stopc通知另一个主循环退出。 [nil channel的用法参考](https://lingchao.xin/post/why-are-there-nil-channels-in-go.html)
   - 第二个主循环读取Raft协议的更新， 4个channel对应4个分支
     - 定时器超时的时候调用`rc.node.Tick()`，这是etcd raft实现要求的，估计是用来更新选举和心跳超时时间，用来触发对应的错误处理。
-	- `rd := <-rc.node.Ready()`返回一个Ready对象，TODO
-	- `case err := <-rc.transport.ErrorC`接收transport的错误，然后调用`rc.writeError(err)`停止transport和raft.Node，并关闭`rc.httpdonec`(这个channel好像并没有关联任何东西)
+    - `rd := <-rc.node.Ready()`返回一个Ready对象，该分支就是围绕这个对象进行处理,后面再议论
+    - `case err := <-rc.transport.ErrorC`接收transport的错误，然后调用`rc.writeError(err)`停止transport和raft.Node，并关闭`rc.httpdonec`(这个channel好像并没有关联任何东西)
     - `case <-rc.stopc`调用`rc.stop()`停止Raft Server
 	
 ```go
@@ -744,8 +744,16 @@ func (rc *raftNode) serveChannels() {
 		}
 	}
 }
+```
 
+部分关闭函数如下，`rc.writeError()`和`rc.stop()`都会调用`close(rc.CommitC)`以及`close (rc.errorC)`，前者示意Key Value Store (`readCommits()`中)停止，后者示意 REST server（`serveHttpKVAPI()`中） 停止。
 
+server退出的机制：
+
+- 遇到tranport的错误主动退出：，`rc.writeError()`示意KVStore和REST Server退出，bing退出上文的第二个循环，REST Server退出后main函数的defer机制关闭commitC和proposeC，从而退出第一个循环。
+- 第一个循环的commitC和proposeC关闭后，通过rc.stopC停止第二个循环。 //TODO，这是怎么触发的？
+
+```go
 func (rc *raftNode) writeError(err error) {
 	rc.stopHTTP()
 	close(rc.commitC)
@@ -766,6 +774,53 @@ func (rc *raftNode) stop() {
 	close(rc.commitC)
 	close(rc.errorC)
 	rc.node.Stop()
+}
+```
+
+最后重点看一下`serveChannel()`第二个循环`case rd := <-rc.node.Ready():`这个分支
+
+```go
+// Ready encapsulates the entries and messages that are ready to read,
+// be saved to stable storage, committed or sent to other peers.
+// All fields in Ready are read-only.
+type Ready struct {
+	// The current volatile state of a Node.
+	// SoftState will be nil if there is no update.
+	// It is not required to consume or store SoftState.
+	*SoftState
+
+	// The current state of a Node to be saved to stable storage BEFORE
+	// Messages are sent.
+	// HardState will be equal to empty state if there is no update.
+	pb.HardState
+
+	// ReadStates can be used for node to serve linearizable read requests locally
+	// when its applied index is greater than the index in ReadState.
+	// Note that the readState will be returned when raft receives msgReadIndex.
+	// The returned is only valid for the request that requested to read.
+	ReadStates []ReadState
+
+	// Entries specifies entries to be saved to stable storage BEFORE
+	// Messages are sent.
+	Entries []pb.Entry
+
+	// Snapshot specifies the snapshot to be saved to stable storage.
+	Snapshot pb.Snapshot
+
+	// CommittedEntries specifies entries to be committed to a
+	// store/state-machine. These have previously been committed to stable
+	// store.
+	CommittedEntries []pb.Entry
+
+	// Messages specifies outbound messages to be sent AFTER Entries are
+	// committed to stable storage.
+	// If it contains a MsgSnap message, the application MUST report back to raft
+	// when the snapshot has been received or has failed by calling ReportSnapshot.
+	Messages []pb.Message
+
+	// MustSync indicates whether the HardState and Entries must be synchronously
+	// written to disk or if an asynchronous write is permissible.
+	MustSync bool
 }
 ```
 

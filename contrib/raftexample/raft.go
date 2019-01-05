@@ -416,6 +416,7 @@ func (rc *raftNode) serveChannels() {
 			}
 		}
 		// client closed channel; shutdown raft if not already
+		log.Printf("serveChannels(): close (rc.stop)")
 		close(rc.stopc)
 	}()
 
@@ -443,10 +444,12 @@ func (rc *raftNode) serveChannels() {
 			rc.node.Advance()
 
 		case err := <-rc.transport.ErrorC:
+			log.Printf("serveChannels() rc.transport.ErrorC recv")
 			rc.writeError(err)
 			return
 
 		case <-rc.stopc:
+			log.Printf("serveChannels() rc.stop recv")
 			rc.stop()
 			return
 		}

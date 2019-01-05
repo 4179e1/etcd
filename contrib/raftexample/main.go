@@ -16,6 +16,7 @@ package main
 
 import (
 	"flag"
+	"log"
 	"strings"
 
 	"go.etcd.io/etcd/raft/raftpb"
@@ -42,4 +43,6 @@ func main() {
 
 	// the key-value http handler will propose updates to raft
 	serveHttpKVAPI(kvs, *kvport, confChangeC, errorC)
+
+	log.Printf("Server stopped")
 }
