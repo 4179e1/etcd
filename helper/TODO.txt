@@ -9,3 +9,4 @@
 - error
   - compare predefined errors
   - ClosedConn
+

@@ -1,6 +1,9 @@
 all:
 	go build go.etcd.io/etcd/contrib/raftexample
 
+dump:
+	go build go.etcd.io/etcd/tools/etcd-dump-logs
+
 clean: 
 	rm -rf raftexample*
 
