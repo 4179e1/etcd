@@ -137,7 +137,7 @@ func (s *Snapshotter) save(snapshot *raftpb.Snapshot) error {
 
 - `Load()`首先调用`s.snapNames()`获取快照目录下的所有快照文件名，并反向排序，即Term, Index序号大的文件排在前面
 - 然后通过一个循环调用`loadSnap()`尝试去读取这些快照文件，任何一个读取成功则退出循环，这是因为有些快照文件可能是有问题的，数据不能用
-- `loadSnap()`只是对`Read()`的封装，如果读取失败或者读到了无效的数据则尝试删除快照文件。
+- `loadSnap()`只是对`Read()`的封装，如果读取失败或者读到了无效的数据则尝试修改快照文件名，在后面加一个`.broken`的后缀。
 - `Read()`从去读快照文件后进行两次反序列化
   - 把文件内容反序列化为`etcd snapshot`， 并计算crc是否符合预期
   - crc校验通过则继续把`etcd snapshot`的`data`字段反序列化为`raft snapshot`
