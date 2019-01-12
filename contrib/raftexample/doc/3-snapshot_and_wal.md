@@ -185,3 +185,42 @@ func loadSnap(lg *zap.Logger, dir, name string) (*raftpb.Snapshot, error) {
 ```
 
 ## WAL
+
+`Write Ahead Logging`预写式日志通常是在应用在响应一个请求结果前，先把请求的结果写到磁盘中。etcd的WAL记录了集群所有的操作，包括但不限于：
+
+- 集群成员变更
+- commited log
+- 创建一个snapshot
+- ……
+
+WAL文件按照`<sequence>-<index>.wal`的方式命名，例如`0000000000000001-00000000deadbeef.wal`，其中`<sequence>`是WAL文件的序号，`<index>`是Raft日志的序号。
+这些文件预分配64MB，写入超过这个值后会切割。
+
+
+### WAL的格式
+
+WAL可以想象为一个支持不同数据类型的数组，数组元素的类型包括：
+
+```go
+const (
+	metadataType int64 = iota + 1
+	entryType
+	stateType
+	crcType
+	snapshotType
+)
+```
+
+
+### WAL和snapshot的关系
+
+etcd在启动并加载快照后，会根据快照metadata中的index找到包含这条index的WAL文件，从WAL的这条index后面的日志开始读取，忽略前面的WAL和日志。
+
+正常来说，快照前面的WAL是不再需要的，etcd的[issue#1810](https://github.com/etcd-io/etcd/pull/1810)加入了自动清理WAL的功能，而我们的raftexample则完全没有这个功能。
+
+
+
+## Reference
+
+- [etcd raft模块分析--WAL日志](https://my.oschina.net/fileoptions/blog/1825531)
+- [ETCD V3 中的 .wal 文件](https://blog.zhesih.com/2017/10/03/the-wal-files-in-etcd-v3/)

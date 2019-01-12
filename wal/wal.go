@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -387,11 +388,14 @@ func (w *WAL) ReadAll() (metadata []byte, state raftpb.HardState, ents []raftpb.
 				ents = append(ents[:e.Index-w.start.Index-1], e)
 			}
 			w.enti = e.Index
+			log.Printf("entryType index %d", e.Index)
 
 		case stateType:
+			log.Printf("stateType")
 			state = mustUnmarshalState(rec.Data)
 
 		case metadataType:
+			log.Printf("metadataType")
 			if metadata != nil && !bytes.Equal(metadata, rec.Data) {
 				state.Reset()
 				return nil, state, nil, ErrMetadataConflict
@@ -399,6 +403,7 @@ func (w *WAL) ReadAll() (metadata []byte, state raftpb.HardState, ents []raftpb.
 			metadata = rec.Data
 
 		case crcType:
+			log.Printf("crcType")
 			crc := decoder.crc.Sum32()
 			// current crc of decoder must match the crc of the record.
 			// do no need to match 0 crc, since the decoder is a new one at this case.
@@ -409,6 +414,7 @@ func (w *WAL) ReadAll() (metadata []byte, state raftpb.HardState, ents []raftpb.
 			decoder.updateCRC(rec.Crc)
 
 		case snapshotType:
+			log.Printf("snapshotType")
 			var snap walpb.Snapshot
 			pbutil.MustUnmarshal(&snap, rec.Data)
 			if snap.Index == w.start.Index {
@@ -420,6 +426,7 @@ func (w *WAL) ReadAll() (metadata []byte, state raftpb.HardState, ents []raftpb.
 			}
 
 		default:
+			log.Printf("unknownType")
 			state.Reset()
 			return nil, state, nil, fmt.Errorf("unexpected block type %d", rec.Type)
 		}
