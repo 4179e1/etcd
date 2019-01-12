@@ -189,19 +189,19 @@ func loadSnap(lg *zap.Logger, dir, name string) (*raftpb.Snapshot, error) {
 `Write Ahead Logging`预写式日志通常是在应用在响应一个请求结果前，先把请求的结果写到磁盘中。etcd的WAL记录了集群所有的操作，包括但不限于：
 
 - 集群成员变更
-- commited log
+- commited log
 - 创建一个snapshot
 - ……
 
-WAL文件按照`<sequence>-<index>.wal`的方式命名，例如`0000000000000001-00000000deadbeef.wal`，其中`<sequence>`是WAL文件的序号，`<index>`是Raft日志的序号。
-这些文件预分配64MB，写入超过这个值后会切割。
+WAL文件按照`<sequence>-<index>.wal`的方式命名，例如`0000000000000001-00000000deadbeef.wal`，其中`<sequence>`是WAL文件的序号，`<index>`是Raft日志的序号。
+这些文件预分配64MB，写入超过这个值后会切割。
 
 
-### WAL的格式
+### WAL的格式
 
-WAL可以想象为一个支持不同数据类型的数组，数组元素的类型包括：
+WAL可以想象为一个支持不同数据类型的数组，数组元素的类型包括：
 
-```go
+```go
 const (
 	metadataType int64 = iota + 1  // WAL的metadata，不知道干啥的
 	entryType      // Raft的提交日志raftpb.Entry
@@ -217,9 +217,9 @@ const (
 后续WAL文件的开头
 ![](https://github.com/4179e1/etcd/raw/master/contrib/raftexample/doc/pic/cut_wal.jpeg)
 
-首个WAL和后续不同的在于那个snapshot，里面的Index和Term都是0，所以当snapshot不存在的情况下，会从它的后一条记录开始读取WAL。
+首个WAL和后续不同的在于那个snapshot，里面的Index和Term都是0，所以当snapshot不存在的情况下，会从它的后一条记录开始读取WAL。
 
-后续写入WAL的时候，每次会包含数目不定的entryType，以及一个stateType，如下面魔改`wal.ReadAll()`产生的输出所示
+后续写入WAL的时候，每次会包含数目不定的entryType，以及一个stateType，如下面魔改`wal.ReadAll()`产生的输出所示
 
 ```
 2019-01-12 17:38:54.860629 I | crcType
@@ -294,11 +294,11 @@ term         index      type    data
 > 这个工具同样可以dump raftexample的日志，但是很多内容它认不出来。
 
 
-### WAL和snapshot的关系
+### WAL和snapshot的关系
 
-etcd在启动并加载快照后，会根据快照metadata中的index找到包含这条index的WAL文件，从WAL的这条index后面的日志开始读取，忽略前面的WAL和日志。
+etcd在启动并加载快照后，会根据快照metadata中的index找到包含这条index的WAL文件，从WAL的这条index后面的日志开始读取，忽略前面的WAL和日志。
 
-正常来说，快照前面的WAL是不再需要的，etcd的[issue#1810](https://github.com/etcd-io/etcd/pull/1810)加入了自动清理WAL的功能，而我们的raftexample则完全没有这个功能。
+正常来说，快照前面的WAL是不再需要的，etcd的[issue#1810](https://github.com/etcd-io/etcd/pull/1810)加入了自动清理WAL的功能，而我们的raftexample则完全没有这个功能。
 
 
 
