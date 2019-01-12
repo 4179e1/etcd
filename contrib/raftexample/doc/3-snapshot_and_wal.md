@@ -203,13 +203,95 @@ WAL可以想象为一个支持不同数据类型的数组，数组元素的类�
 
 ```go
 const (
-	metadataType int64 = iota + 1
-	entryType
-	stateType
-	crcType
-	snapshotType
+	metadataType int64 = iota + 1  // WAL的metadata，不知道干啥的
+	entryType      // Raft的提交日志raftpb.Entry
+	stateType      // raftpb.HardState
+	crcType        // WAL文件中，截止至今的crc校验和 
+	snapshotType   // walpb.Snapshot ,这里只记录了snapshot的Index和Term
 )
 ```
+
+首个WAL文件的开头是这样的
+![](https://github.com/4179e1/etcd/raw/master/contrib/raftexample/doc/pic/initial_wal.jpg)
+
+后续WAL文件的开头
+![](https://github.com/4179e1/etcd/raw/master/contrib/raftexample/doc/pic/cut_wal.jpeg)
+
+首个WAL和后续不同的在于那个snapshot，里面的Index和Term都是0，所以当snapshot不存在的情况下，会从它的后一条记录开始读取WAL。
+
+后续写入WAL的时候，每次会包含数目不定的entryType，以及一个stateType，如下面魔改`wal.ReadAll()`产生的输出所示
+
+```
+2019-01-12 17:38:54.860629 I | crcType
+2019-01-12 17:38:54.860659 I | metadataType
+2019-01-12 17:38:54.860666 I | snapshotType
+2019-01-12 17:38:54.860677 I | entryType index 1
+2019-01-12 17:38:54.860684 I | entryType index 2
+2019-01-12 17:38:54.860690 I | entryType index 3
+2019-01-12 17:38:54.860695 I | stateType
+2019-01-12 17:38:54.860704 I | stateType
+2019-01-12 17:38:54.860711 I | entryType index 4
+2019-01-12 17:38:54.860716 I | stateType
+2019-01-12 17:38:54.860722 I | entryType index 5
+2019-01-12 17:38:54.860727 I | stateType
+2019-01-12 17:38:54.860735 I | entryType index 6
+2019-01-12 17:38:54.860740 I | stateType
+2019-01-12 17:38:54.860745 I | entryType index 7
+2019-01-12 17:38:54.860750 I | stateType
+2019-01-12 17:38:54.860756 I | entryType index 8
+2019-01-12 17:38:54.860761 I | stateType
+2019-01-12 17:38:54.860767 I | entryType index 9
+2019-01-12 17:38:54.860772 I | stateType
+2019-01-12 17:38:54.860778 I | entryType index 10
+2019-01-12 17:38:54.860782 I | stateType
+2019-01-12 17:38:54.860801 I | entryType index 11
+2019-01-12 17:38:54.860805 I | stateType
+2019-01-12 17:38:54.860810 I | snapshotType
+2019-01-12 17:38:54.860821 I | entryType index 12
+2019-01-12 17:38:54.860828 I | entryType index 13
+2019-01-12 17:38:54.860833 I | stateType
+2019-01-12 17:38:54.860838 I | stateType
+2019-01-12 17:38:54.860844 I | entryType index 14
+2019-01-12 17:38:54.860849 I | stateType
+2019-01-12 17:38:54.860854 I | entryType index 15
+2019-01-12 17:38:54.860860 I | stateType
+2019-01-12 17:38:54.860865 I | entryType index 16
+```
+
+
+### WAL内容
+上一节讲述的WAL的格式，但raft协议关心的只有entryType，其中包括提交日志和配置变更等。
+
+etcd提供了一个[etcd-dump-logs](https://github.com/etcd-io/etcd/tree/master/tools/etcd-dump-logs)来查看WAL的内容，以下内容取自一个三节点的测试环境环境：
+```
+W
+Snapshot:
+empty
+Start dupmping log entries from snapshot.
+WAL metadata:
+nodeID=da37c2e9715e7728 clusterID=cbe50ed33c7d3758 term=407449 commitIndex=14825 vote=da37c2e9715e7728
+WAL entries:
+lastIndex=14826
+term         index      type    data
+   1             1      conf    method=ConfChangeAddNode id=880db10f35870d26
+   1             2      conf    method=ConfChangeAddNode id=da37c2e9715e7728
+   1             3      conf    method=ConfChangeAddNode id=e1aabd4a7f715232
+  54             4      norm
+  54             5      norm    method=PUT path="/0/members/da37c2e9715e7728/attributes" val="{\"name\":\"s1\",\"clientURLs\":[\"http://192.168.1.160:2379\"]}"
+  54             6      norm    method=PUT path="/0/members/880db10f35870d26/attributes" val="{\"name\":\"s2\",\"clientURLs\":[\"http://192.168.1.224:2379\"]}"
+  54             7      norm    method=PUT path="/0/version" val="3.0.0"
+  54             8      norm    method=PUT path="/0/members/e1aabd4a7f715232/attributes" val="{\"name\":\"s3\",\"clientURLs\":[\"http://192.168.1.30:2379\"]}"
+  54             9      norm    method=PUT path="/0/version" val="3.3.0"
+  54            10      norm    header:<ID:8586224779106083855 > put:<key:"mykey" value:"this is awesome" >
+ ...
+```
+
+我们可以看到，前面三条都是配置更改，这个集群的初始成员为空， 每增加一个成员都有一条对应的记录。
+
+
+> 这里列出了一些预期的输出格式(https://github.com/etcd-io/etcd/tree/master/tools/etcd-dump-logs/expectedoutput)
+
+> 这个工具同样可以dump raftexample的日志，但是很多内容它认不出来。
 
 
 ### WAL和snapshot的关系
