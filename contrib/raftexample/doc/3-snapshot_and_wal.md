@@ -339,8 +339,6 @@ WAL通过`Create()`创建，一个非常长的函数
 根据(https://lwn.net/Articles/457667/):
 > The more subtle usages deal with newly created files, or overwriting existing files. A newly created file may require an fsync() of not just the file itself, but also of the directory in which it was created (since this is where the file system looks to find your file). This behavior is actually file system (and mount option) dependent. You can either code specifically for each file system and mount option combination, or just perform fsync() calls on the directories to ensure that your code is portable. 
 
-而wal的`decoder`本身会调用`Fsync()`。
-
 ```go
 // Create creates a WAL ready for appending records. The given metadata is
 // recorded at the head of each WAL file, and can be retrieved with ReadAll.
@@ -736,11 +734,15 @@ func (pw *PageWriter) Flush() error {
 
 `walpb.Reacord`通过`encode()`方法提交给`pageWriter`进行写入，每写入一条`walpb.Record`，它总是先通过`writeUint64()`写入这个记录的长度，然后再通过`e.bw.Write(data)`写入实际的数据。
 
-这里需要注意的一点是这里的`data`总是按照8字节对齐的，如果其长度不是8的倍数，则需要补0，`encodeFrameSize()`就是做这个的，它返回`data`的*长度*`lenField`以及需要补充的字节数`padBytes`。注意以下`lenField`的计算，它实际由4个部分组成
+这里需要注意的一点是这里的`data`总是按照8字节对齐的，如果其长度不是8的倍数，则需要补0，`encodeFrameSize()`就是做这个的，它返回`data`的*长度*`lenField`以及需要补充的字节数`padBytes`。注意以下`lenField`的计算，它实际由4个部分组成:
+
 - MSB第1位如果为1表示有填充
 - MSB2-5位没有使用
 - MSB6-8位表示填充字段的长度，即`padBytes`的二进制表示，最大可能的取值为7，即111
 - 最后56位才是`data`的实际长度
+
+好了，现在我们总算了解wal文件完整的数据结构了
+![](https://github.com/4179e1/etcd/raw/master/contrib/raftexample/doc/pic/wal.png)
 
 ```go
 func (e *encoder) encode(rec *walpb.Record) error {
@@ -804,6 +806,223 @@ func writeUint64(w io.Writer, n uint64, buf []byte) error {
 }
 
 ```
+
+### 写入WAL
+
+WAL中封装了几种常用类型的save方法，分别是
+- saveCrc
+- SaveSnapShot
+- saveState
+- saveEntry
+- 以及封装了saveState和saveEntry的Save方法
+
+```go
+func (w *WAL) saveState(s *raftpb.HardState) error {
+	if raft.IsEmptyHardState(*s) {
+		return nil
+	}
+	w.state = *s
+	b := pbutil.MustMarshal(s)
+	rec := &walpb.Record{Type: stateType, Data: b}
+	return w.encoder.encode(rec)
+}
+
+func (w *WAL) Save(st raftpb.HardState, ents []raftpb.Entry) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// short cut, do not call sync
+	if raft.IsEmptyHardState(st) && len(ents) == 0 {
+		return nil
+	}
+
+	mustSync := raft.MustSync(st, w.state, len(ents))
+
+	// TODO(xiangli): no more reference operator
+	for i := range ents {
+		if err := w.saveEntry(&ents[i]); err != nil {
+			return err
+		}
+	}
+	if err := w.saveState(&st); err != nil {
+		return err
+	}
+
+	curOff, err := w.tail().Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+	if curOff < SegmentSizeBytes {
+		if mustSync {
+			return w.sync()
+		}
+		return nil
+	}
+
+	return w.cut()
+}
+```
+
+### decoder - 用来读取WAL
+
+#### decoder 结构
+
+跟`encoder`对应的是`decoder`，`newEncoder`的参数就是`Create`时的`rs`这个切片，记录了所有需要打开的wal文件
+
+```go
+const minSectorSize = 512
+
+// frameSizeBytes is frame size in bytes, including record size and padding size.
+const frameSizeBytes = 8
+
+type decoder struct {
+	mu  sync.Mutex
+	brs []*bufio.Reader
+
+	// lastValidOff file offset following the last valid decoded record
+	lastValidOff int64
+	crc          hash.Hash32
+}
+
+func newDecoder(r ...io.Reader) *decoder {
+	readers := make([]*bufio.Reader, len(r))
+	for i := range r {
+		readers[i] = bufio.NewReader(r[i])
+	}
+	return &decoder{
+		brs: readers,
+		crc: crc.New(0, crcTable),
+	}
+}
+```
+
+#### encoder读取数据
+
+每次调用`decode`就会读取一段Record，直到一个文件返回EOF，递归读下一个，当所有文件都到了结尾，返回EOF
+
+跟`decoder`相对的，
+- 首先`l, err := readInt64(d.brs[0])`读取Record的长度
+  - 如果读到io.EOF，则尝试读取下一个wal文件
+  - 如果已经是最后一个，则返回io.EOF表示WAL已经读完了
+- `recBytes, padBytes := decodeFrameSize(l)`计算出Record的实际长度和填充的长度
+- 读取总长度的数据并反序列化为`walpb.Record`(通过参数的rec 参数传入
+  - 如果反序列化失败，会检查是不是torn write, `isTornEntry()`会把按照`inSectorSize`的大小即512把`data`拆分成多个chunk，如果任何一个chunk的数据全为0，则认为是一个torn write
+- 计算CRC是不是符合预期
+- 更新文件的偏移量后返回
+
+> so what is a torn write?
+> http://www.joshodgers.com/tag/torn-write/
+
+```go
+func (d *decoder) decode(rec *walpb.Record) error {
+	rec.Reset()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.decodeRecord(rec)
+}
+
+func (d *decoder) decodeRecord(rec *walpb.Record) error {
+	if len(d.brs) == 0 {
+		return io.EOF
+	}
+
+	l, err := readInt64(d.brs[0])
+	if err == io.EOF || (err == nil && l == 0) {
+		// hit end of file or preallocated space
+		d.brs = d.brs[1:]
+		if len(d.brs) == 0 {
+			return io.EOF
+		}
+		d.lastValidOff = 0
+		return d.decodeRecord(rec)
+	}
+	if err != nil {
+		return err
+	}
+
+	recBytes, padBytes := decodeFrameSize(l)
+
+	data := make([]byte, recBytes+padBytes)
+	if _, err = io.ReadFull(d.brs[0], data); err != nil {
+		// ReadFull returns io.EOF only if no bytes were read
+		// the decoder should treat this as an ErrUnexpectedEOF instead.
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+		return err
+	}
+	if err := rec.Unmarshal(data[:recBytes]); err != nil {
+		if d.isTornEntry(data) {
+			return io.ErrUnexpectedEOF
+		}
+		return err
+	}
+
+	// skip crc checking if the record type is crcType
+	if rec.Type != crcType {
+		d.crc.Write(rec.Data)
+		if err := rec.Validate(d.crc.Sum32()); err != nil {
+			if d.isTornEntry(data) {
+				return io.ErrUnexpectedEOF
+			}
+			return err
+		}
+	}
+	// record decoded as valid; point last valid offset to end of record
+	d.lastValidOff += frameSizeBytes + recBytes + padBytes
+	return nil
+}
+
+func decodeFrameSize(lenField int64) (recBytes int64, padBytes int64) {
+	// the record size is stored in the lower 56 bits of the 64-bit length
+	recBytes = int64(uint64(lenField) & ^(uint64(0xff) << 56))
+	// non-zero padding is indicated by set MSb / a negative length
+	if lenField < 0 {
+		// padding is stored in lower 3 bits of length MSB
+		padBytes = int64((uint64(lenField) >> 56) & 0x7)
+	}
+	return recBytes, padBytes
+}
+
+// isTornEntry determines whether the last entry of the WAL was partially written
+// and corrupted because of a torn write.
+func (d *decoder) isTornEntry(data []byte) bool {
+	if len(d.brs) != 1 {
+		return false
+	}
+
+	fileOff := d.lastValidOff + frameSizeBytes
+	curOff := 0
+	chunks := [][]byte{}
+	// split data on sector boundaries
+	for curOff < len(data) {
+		chunkLen := int(minSectorSize - (fileOff % minSectorSize))
+		if chunkLen > len(data)-curOff {
+			chunkLen = len(data) - curOff
+		}
+		chunks = append(chunks, data[curOff:curOff+chunkLen])
+		fileOff += int64(chunkLen)
+		curOff += chunkLen
+	}
+
+	// if any data for a sector chunk is all 0, it's a torn write
+	for _, sect := range chunks {
+		isZero := true
+		for _, v := range sect {
+			if v != 0 {
+				isZero = false
+				break
+			}
+		}
+		if isZero {
+			return true
+		}
+	}
+	return false
+}
+```
+
+
 
 ## Reference
 
