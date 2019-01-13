@@ -199,7 +199,17 @@ WAL文件按照`<sequence>-<index>.wal`的方式命名，例如`0000000000000001
 
 ### WAL的格式
 
-WAL可以想象为一个支持不同数据类型的数组，数组元素的类型包括：
+WAL保存的数据是`Protocol Buffer`序列化后的`walpb.Record`组成，其结构为
+```go
+type Record struct {
+	Type             int64  `protobuf:"varint,1,opt,name=type" json:"type"`
+	Crc              uint32 `protobuf:"varint,2,opt,name=crc" json:"crc"`
+	Data             []byte `protobuf:"bytes,3,opt,name=data" json:"data,omitempty"`
+	XXX_unrecognized []byte `json:"-"`
+}
+```
+
+其中Data是上层数据结构序列化后的数据，Crc是*所有`walpb.Record`记录*到目前为止的校验和，Type包括以下类型：
 
 ```go
 const (
@@ -628,7 +638,7 @@ encoder结构中有一个`bw *ioutil.PageWriter`的成员，这里才真正把�
 - 首先看看这个数据放到buf的话会不会超过水位，如果不会则放到buf就返回
 - 否则看看填满一个page还需要多少字节`slack := pw.pageBytes - ((pw.pageOffset + pw.bufferedBytes) % pw.pageBytes)`
   - 先不考虑`partial := slack > len(p)`的情况，我们先把一页给填满，
-  - partial的情况我没看明白会在什么条件触发，可能跟初始的pageOffset有关，不过如果一开始判断加上新写入的数据会超过水位的话，这里没道理新数据的长度会小于`写满一个page需要的长度`。
+  - partial的情况我没看明白会在什么条件触发，可能跟初始的pageOffset有关，不过如果一开始判断加上新写入的数据会超过水位的话，这里没道理`新数据的长度`会小于`写满一个page需要的长度`。
 - Flush buf中的所有数据
 - `if len(p) > pw.pageBytes`如果还有剩下没写入的数据，按page对其后直接写入io.Writer里面，不走buffer了。
 - 经过上面的处理，可能还有有一小截没写入的数据，它的大小小于一个page，递归调用自己`pw.Write(p)`把这些数据放到buf中
@@ -724,18 +734,15 @@ func (pw *PageWriter) Flush() error {
 
 #### encoder写入数据
 
-对外提供的接口是`func newFileEncoder(f *os.File, prevCrc uint32) (*encoder, error)`
+`walpb.Reacord`通过`encode()`方法提交给`pageWriter`进行写入，每写入一条`walpb.Record`，它总是先通过`writeUint64()`写入这个记录的长度，然后再通过`e.bw.Write(data)`写入实际的数据。
+
+这里需要注意的一点是这里的`data`总是按照8字节对齐的，如果其长度不是8的倍数，则需要补0，`encodeFrameSize()`就是做这个的，它返回`data`的*长度*`lenField`以及需要补充的字节数`padBytes`。注意以下`lenField`的计算，它实际由4个部分组成
+- MSB第1位如果为1表示有填充
+- MSB2-5位没有使用
+- MSB6-8位表示填充字段的长度，即`padBytes`的二进制表示，最大可能的取值为7，即111
+- 最后56位才是`data`的实际长度
 
 ```go
-// newFileEncoder creates a new encoder with current file offset for the page writer.
-func newFileEncoder(f *os.File, prevCrc uint32) (*encoder, error) {
-	offset, err := f.Seek(0, io.SeekCurrent)
-	if err != nil {
-		return nil, err
-	}
-	return newEncoder(f, prevCrc, int(offset)), nil
-}
-
 func (e *encoder) encode(rec *walpb.Record) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -783,12 +790,19 @@ func encodeFrameSize(dataBytes int) (lenField uint64, padBytes int) {
 	return lenField, padBytes
 }
 
+func (e *encoder) flush() error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.bw.Flush()
+}
+
 func writeUint64(w io.Writer, n uint64, buf []byte) error {
 	// http://golang.org/src/encoding/binary/binary.go
 	binary.LittleEndian.PutUint64(buf, n)
 	_, err := w.Write(buf)
 	return err
 }
+
 ```
 
 ## Reference
