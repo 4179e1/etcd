@@ -621,7 +621,7 @@ func newFileEncoder(f *os.File, prevCrc uint32) (*encoder, error) {
 
 #### ioutil.PageWriter
 
-encoder结构中有一个`bw *ioutil.PageWriter`的成员，这里才真正把数据写入磁盘，他的作用是按照page的大小对齐buffer的数据，当数据大小达到o
+encoder结构中有一个`bw *ioutil.PageWriter`的成员，这里才真正把数据写入磁盘，他的作用是按照page的大小对齐buffer的数据，并在缓存大小大于水位时下刷。
 
 数据结构如下：
 - w io.Writer 文件io.Writer对象
@@ -882,6 +882,19 @@ func MustSync(st, prevst pb.HardState, entsnum int) bool {
 ```
 
 最后如果文件的长度超过了64MiB，调用`cut()`方法开始写下一个wal文件
+
+- 关闭当前的wal文件,sync
+- `newTail, err := w.fp.Open()`从filePipeline中拿到预先创建的wal文件（0.tmp或者1.tmp)
+- 在新的wal文件上创建新的`encoder`对象并替换现有的
+- 往新的wal文件里面写入三个Record （上文提到过这三个Record是什么）
+  - `w.saveCrc(prevCrc)`累计至今的CRC校验和
+  - `w.encoder.encode(&walpb.Record{Type: metadataType, Data: w.metadata})`写入metadata
+  - `w.saveState(&w.state)`
+- sync
+- 重命名wal文件为`<seq>-<index>.wal`,然后在wal目录上执行Fsync()确保重命名成功
+- 关闭wal
+- 重新用`fileutil.LockFile()`打开wal文件确保加锁
+- 重新设置`encoder`对象
 
 ```go
 // cut closes current file written and creates a new one ready to append.
