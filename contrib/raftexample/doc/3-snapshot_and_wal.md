@@ -863,6 +863,117 @@ func (w *WAL) Save(st raftpb.HardState, ents []raftpb.Entry) error {
 }
 ```
 
+其中`raft.MustSync`会检查以下三项来确定是否需要调用`w.sync()`进行持久化
+- entry的数目非0
+- Vote的状态发生变化（从未投票到投了票，投票的对象在同一个Term是不能改的）
+- Term任期发生了变化
+
+```go
+// MustSync returns true if the hard state and count of Raft entries indicate
+// that a synchronous write to persistent storage is required.
+func MustSync(st, prevst pb.HardState, entsnum int) bool {
+	// Persistent state on all servers:
+	// (Updated on stable storage before responding to RPCs)
+	// currentTerm
+	// votedFor
+	// log entries[]
+	return entsnum != 0 || st.Vote != prevst.Vote || st.Term != prevst.Term
+}
+```
+
+最后如果文件的长度超过了64MiB，调用`cut()`方法开始写下一个wal文件
+
+```go
+// cut closes current file written and creates a new one ready to append.
+// cut first creates a temp wal file and writes necessary headers into it.
+// Then cut atomically rename temp wal file to a wal file.
+func (w *WAL) cut() error {
+	// close old wal file; truncate to avoid wasting space if an early cut
+	off, serr := w.tail().Seek(0, io.SeekCurrent)
+	if serr != nil {
+		return serr
+	}
+
+	if err := w.tail().Truncate(off); err != nil {
+		return err
+	}
+
+	if err := w.sync(); err != nil {
+		return err
+	}
+
+	fpath := filepath.Join(w.dir, walName(w.seq()+1, w.enti+1))
+
+	// create a temp wal file with name sequence + 1, or truncate the existing one
+	newTail, err := w.fp.Open()
+	if err != nil {
+		return err
+	}
+
+	// update writer and save the previous crc
+	w.locks = append(w.locks, newTail)
+	prevCrc := w.encoder.crc.Sum32()
+	w.encoder, err = newFileEncoder(w.tail().File, prevCrc)
+	if err != nil {
+		return err
+	}
+
+	if err = w.saveCrc(prevCrc); err != nil {
+		return err
+	}
+
+	if err = w.encoder.encode(&walpb.Record{Type: metadataType, Data: w.metadata}); err != nil {
+		return err
+	}
+
+	if err = w.saveState(&w.state); err != nil {
+		return err
+	}
+
+	// atomically move temp wal file to wal file
+	if err = w.sync(); err != nil {
+		return err
+	}
+
+	off, err = w.tail().Seek(0, io.SeekCurrent)
+	if err != nil {
+		return err
+	}
+
+	if err = os.Rename(newTail.Name(), fpath); err != nil {
+		return err
+	}
+	if err = fileutil.Fsync(w.dirFile); err != nil {
+		return err
+	}
+
+	// reopen newTail with its new path so calls to Name() match the wal filename format
+	newTail.Close()
+
+	if newTail, err = fileutil.LockFile(fpath, os.O_WRONLY, fileutil.PrivateFileMode); err != nil {
+		return err
+	}
+	if _, err = newTail.Seek(off, io.SeekStart); err != nil {
+		return err
+	}
+
+	w.locks[len(w.locks)-1] = newTail
+
+	prevCrc = w.encoder.crc.Sum32()
+	w.encoder, err = newFileEncoder(w.tail().File, prevCrc)
+	if err != nil {
+		return err
+	}
+
+	if w.lg != nil {
+		w.lg.Info("created a new WAL segment", zap.String("path", fpath))
+	} else {
+		plog.Infof("segmented wal file %v is created", fpath)
+	}
+	return nil
+}
+```
+
 ### decoder - 用来读取WAL
 
 #### decoder 结构
