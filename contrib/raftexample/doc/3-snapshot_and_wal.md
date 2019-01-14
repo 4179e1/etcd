@@ -480,7 +480,7 @@ func Create(lg *zap.Logger, dirpath string, metadata []byte) (*WAL, error) {
 
 - `names, err := readWALNames(lg, dirpath)`拿到所有WAL文件名 //TODO，我感觉这少做了一个排序
 - `nameIndex, ok := searchIndex(lg, names, snap.Index)`从WAL文件列表中找到包含这个Index的序号
-- 打开这个序号之后的所有WAL文件，用了三种不同接口类型的slice来处理后续的读取和关闭，它们本质上都是`*fileutil.LockedFile`
+- 打开这个序号之后的所有WAL文件，用了三种不同接口类型的slice来处理后续的读取和关闭，它们本质上都是`*fileutil.LockedFile`。ls会用来初始化wal的`locks`字段，当以只读的方式打开是，它的所有成员都是`nil`。
 ```go
 	rcs := make([]io.ReadCloser, 0)
 	rs := make([]io.Reader, 0)
@@ -1026,8 +1026,8 @@ func newDecoder(r ...io.Reader) *decoder {
 
 跟`decoder`相对的，
 - 首先`l, err := readInt64(d.brs[0])`读取Record的长度
-  - 如果读到io.EOF，则尝试读取下一个wal文件
-  - 如果已经是最后一个，则返回io.EOF表示WAL已经读完了
+  - 如果读到io.EOF表示读取到了结尾；或者读出长度为零的Record (`l == 0`),这种情况表示Record写到这里就没有了
+  - 看看还有没有下一个wal文件，如果没有，则返回io.EOF表示WAL已经读完了
 - `recBytes, padBytes := decodeFrameSize(l)`计算出Record的实际长度和填充的长度
 - 读取总长度的数据并反序列化为`walpb.Record`(通过参数的rec 参数传入
   - 如果反序列化失败，会检查是不是torn write, `isTornEntry()`会把按照`inSectorSize`的大小即512把`data`拆分成多个chunk，如果任何一个chunk的数据全为0，则认为是一个torn write
@@ -1146,7 +1146,155 @@ func (d *decoder) isTornEntry(data []byte) bool {
 }
 ```
 
+### 读取WAL
 
+读取WAL的接口正是之前看到过的`ReadAll()`，它decode所有wal Record，不同的Record有不同的处理方式
+
+- entryType：直接append到返回值的`ents`中，如果entry的index大于快照的起始Index `w.start.Index`
+- stateType：迭代取最后一个值
+- metatDatType: 迭代取最后一个值
+- crcType：用于校验
+- snapshotType：检查是否有快照的Index跟`w.start.Index`相同，有的话认为匹配到了这个快照
+
+//TODO w.tail() 到底返回了什么？
+循环结束时可能是遇到了错误，也有可能是读到了EOF，`switch w.tail()`其实是用来检查wal用只读还是读写的方式打开。 
+- `case nil`表示只读打开，如果错误不是EOF，返回错误
+- `default`表示以读写的方式打开
+  - 如果错误不是EOF，返回
+  - 注释说`decodeRecord() will return io.EOF if it detects a zero record, but this zero record may be followed by non-zero records from a torn write.`,因此后面可以把后面的内容用`fileutil.ZeroToEnd()`清零。这里说的是`decordRecord()`中`err == nil && l == 0`这个情况。
+
+函数的最后一部分
+- 关闭decoder，禁用read
+- `w.start = walpb.Snapshot{}`重置起始位置，这是要干啥？
+- 如果以读写方式打开，重新设置encoder
+- 返回前面entry的结果
+
+```go
+// ReadAll reads out records of the current WAL.
+// If opened in write mode, it must read out all records until EOF. Or an error
+// will be returned.
+// If opened in read mode, it will try to read all records if possible.
+// If it cannot read out the expected snap, it will return ErrSnapshotNotFound.
+// If loaded snap doesn't match with the expected one, it will return
+// all the records and error ErrSnapshotMismatch.
+// TODO: detect not-last-snap error.
+// TODO: maybe loose the checking of match.
+// After ReadAll, the WAL will be ready for appending new records.
+func (w *WAL) ReadAll() (metadata []byte, state raftpb.HardState, ents []raftpb.Entry, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	rec := &walpb.Record{}
+	decoder := w.decoder
+
+	var match bool
+	for err = decoder.decode(rec); err == nil; err = decoder.decode(rec) {
+		switch rec.Type {
+		case entryType:
+			e := mustUnmarshalEntry(rec.Data)
+			if e.Index > w.start.Index {
+				ents = append(ents[:e.Index-w.start.Index-1], e)
+			}
+			w.enti = e.Index
+			log.Printf("entryType index %d", e.Index)
+
+		case stateType:
+			log.Printf("stateType")
+			state = mustUnmarshalState(rec.Data)
+
+		case metadataType:
+			log.Printf("metadataType")
+			if metadata != nil && !bytes.Equal(metadata, rec.Data) {
+				state.Reset()
+				return nil, state, nil, ErrMetadataConflict
+			}
+			metadata = rec.Data
+
+		case crcType:
+			log.Printf("crcType")
+			crc := decoder.crc.Sum32()
+			// current crc of decoder must match the crc of the record.
+			// do no need to match 0 crc, since the decoder is a new one at this case.
+			if crc != 0 && rec.Validate(crc) != nil {
+				state.Reset()
+				return nil, state, nil, ErrCRCMismatch
+			}
+			decoder.updateCRC(rec.Crc)
+
+		case snapshotType:
+			log.Printf("snapshotType")
+			var snap walpb.Snapshot
+			pbutil.MustUnmarshal(&snap, rec.Data)
+			if snap.Index == w.start.Index {
+				if snap.Term != w.start.Term {
+					state.Reset()
+					return nil, state, nil, ErrSnapshotMismatch
+				}
+				match = true
+			}
+
+		default:
+			log.Printf("unknownType")
+			state.Reset()
+			return nil, state, nil, fmt.Errorf("unexpected block type %d", rec.Type)
+		}
+	}
+
+	switch w.tail() {
+	case nil:
+		// We do not have to read out all entries in read mode.
+		// The last record maybe a partial written one, so
+		// ErrunexpectedEOF might be returned.
+		if err != io.EOF && err != io.ErrUnexpectedEOF {
+			state.Reset()
+			return nil, state, nil, err
+		}
+	default:
+		// We must read all of the entries if WAL is opened in write mode.
+		if err != io.EOF {
+			state.Reset()
+			return nil, state, nil, err
+		}
+		// decodeRecord() will return io.EOF if it detects a zero record,
+		// but this zero record may be followed by non-zero records from
+		// a torn write. Overwriting some of these non-zero records, but
+		// not all, will cause CRC errors on WAL open. Since the records
+		// were never fully synced to disk in the first place, it's safe
+		// to zero them out to avoid any CRC errors from new writes.
+		if _, err = w.tail().Seek(w.decoder.lastOffset(), io.SeekStart); err != nil {
+			return nil, state, nil, err
+		}
+		if err = fileutil.ZeroToEnd(w.tail().File); err != nil {
+			return nil, state, nil, err
+		}
+    }
+    
+	err = nil
+	if !match {
+		err = ErrSnapshotNotFound
+	}
+
+	// close decoder, disable reading
+	if w.readClose != nil {
+		w.readClose()
+		w.readClose = nil
+	}
+	w.start = walpb.Snapshot{}
+
+	w.metadata = metadata
+
+	if w.tail() != nil {
+		// create encoder (chain crc with the decoder), enable appending
+		w.encoder, err = newFileEncoder(w.tail().File, w.decoder.lastCRC())
+		if err != nil {
+			return
+		}
+	}
+	w.decoder = nil
+
+	return metadata, state, ents, err
+}
+```
 
 ## Reference
 
