@@ -1158,7 +1158,7 @@ func (d *decoder) isTornEntry(data []byte) bool {
 
 //TODO w.tail() 到底返回了什么？
 循环结束时可能是遇到了错误，也有可能是读到了EOF，`switch w.tail()`其实是用来检查wal用只读还是读写的方式打开。 
-- `case nil`表示只读打开，如果错误不是EOF，返回错误
+- `case nil`表示只读打开，如果错误不是EOF，返回
 - `default`表示以读写的方式打开
   - 如果错误不是EOF，返回
   - 注释说`decodeRecord() will return io.EOF if it detects a zero record, but this zero record may be followed by non-zero records from a torn write.`,因此后面可以把后面的内容用`fileutil.ZeroToEnd()`清零。这里说的是`decordRecord()`中`err == nil && l == 0`这个情况。
@@ -1293,6 +1293,93 @@ func (w *WAL) ReadAll() (metadata []byte, state raftpb.HardState, ents []raftpb.
 	w.decoder = nil
 
 	return metadata, state, ents, err
+}
+```
+
+### filePipeline
+
+`filePipeline`是wal文件的生产者，通过`newFilePipeline()`新建之后会在一个协程中运行`fp.run()`，生成一个tmp文件，然后阻塞，直到`WAL`调用`open()`取走这个文件，`fp.run()`继续生成下一个，如此循环。tmp文件按照`0.tmp`,`1.tmp`轮流命名。
+
+```go
+// filePipeline pipelines allocating disk space
+type filePipeline struct {
+	lg *zap.Logger
+
+	// dir to put files
+	dir string
+	// size of files to make, in bytes
+	size int64
+	// count number of files generated
+	count int
+
+	filec chan *fileutil.LockedFile
+	errc  chan error
+	donec chan struct{}
+}
+
+func newFilePipeline(lg *zap.Logger, dir string, fileSize int64) *filePipeline {
+	fp := &filePipeline{
+		lg:    lg,
+		dir:   dir,
+		size:  fileSize,
+		filec: make(chan *fileutil.LockedFile),
+		errc:  make(chan error, 1),
+		donec: make(chan struct{}),
+	}
+	go fp.run()
+	return fp
+}
+
+// Open returns a fresh file for writing. Rename the file before calling
+// Open again or there will be file collisions.
+func (fp *filePipeline) Open() (f *fileutil.LockedFile, err error) {
+	select {
+	case f = <-fp.filec:
+	case err = <-fp.errc:
+	}
+	return f, err
+}
+
+func (fp *filePipeline) Close() error {
+	close(fp.donec)
+	return <-fp.errc
+}
+
+func (fp *filePipeline) alloc() (f *fileutil.LockedFile, err error) {
+	// count % 2 so this file isn't the same as the one last published
+	fpath := filepath.Join(fp.dir, fmt.Sprintf("%d.tmp", fp.count%2))
+	if f, err = fileutil.LockFile(fpath, os.O_CREATE|os.O_WRONLY, fileutil.PrivateFileMode); err != nil {
+		return nil, err
+	}
+	if err = fileutil.Preallocate(f.File, fp.size, true); err != nil {
+		if fp.lg != nil {
+			fp.lg.Warn("failed to preallocate space when creating a new WAL", zap.Int64("size", fp.size), zap.Error(err))
+		} else {
+			plog.Errorf("failed to allocate space when creating new wal file (%v)", err)
+		}
+		f.Close()
+		return nil, err
+	}
+	fp.count++
+	return f, nil
+}
+
+func (fp *filePipeline) run() {
+	defer close(fp.errc)
+	for {
+		f, err := fp.alloc()
+		if err != nil {
+			fp.errc <- err
+			return
+		}
+		select {
+		case fp.filec <- f:
+		case <-fp.donec:
+			os.Remove(f.Name())
+			f.Close()
+			return
+		}
+	}
 }
 ```
 
