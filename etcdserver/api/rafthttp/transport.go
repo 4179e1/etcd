@@ -185,7 +185,6 @@ func (t *Transport) Send(msgs []raftpb.Message) {
 		to := types.ID(m.To)
 		//if m.Type != raftpb.MsgHeartbeat && m.Type != raftpb.MsgHeartbeatResp {
 		//	log.Printf("---> %s %v\n", to, m)
-		//	defer log.Printf("---> END")
 		//}
 
 		t.mu.RLock()
