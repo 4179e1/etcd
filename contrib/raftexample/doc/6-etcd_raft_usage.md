@@ -61,6 +61,73 @@ type Ready struct {
 ```
 
 Output的三元组对应：
-- Messages: Messages []pb.Message
-- log entries: Entries []pb.Entry
-- Raft state chanes: pb.HardState。*SoftState算吗？
+1. Messages: Messages []pb.Message
+
+```go
+type Message struct {
+	Type             MessageType `protobuf:"varint,1,opt,name=type,enum=raftpb.MessageType" json:"type"`
+	To               uint64      `protobuf:"varint,2,opt,name=to" json:"to"`
+	From             uint64      `protobuf:"varint,3,opt,name=from" json:"from"`
+	Term             uint64      `protobuf:"varint,4,opt,name=term" json:"term"`
+	LogTerm          uint64      `protobuf:"varint,5,opt,name=logTerm" json:"logTerm"`
+	Index            uint64      `protobuf:"varint,6,opt,name=index" json:"index"`
+	Entries          []Entry     `protobuf:"bytes,7,rep,name=entries" json:"entries"`
+	Commit           uint64      `protobuf:"varint,8,opt,name=commit" json:"commit"`
+	Snapshot         Snapshot    `protobuf:"bytes,9,opt,name=snapshot" json:"snapshot"`
+	Reject           bool        `protobuf:"varint,10,opt,name=reject" json:"reject"`
+	RejectHint       uint64      `protobuf:"varint,11,opt,name=rejectHint" json:"rejectHint"`
+	Context          []byte      `protobuf:"bytes,12,opt,name=context" json:"context,omitempty"`
+	XXX_unrecognized []byte      `json:"-"`
+}
+```
+
+2. log entries: Entries []pb.Entry
+
+```go
+type Entry struct {
+	Term             uint64    `protobuf:"varint,2,opt,name=Term" json:"Term"`
+	Index            uint64    `protobuf:"varint,3,opt,name=Index" json:"Index"`
+	Type             EntryType `protobuf:"varint,1,opt,name=Type,enum=raftpb.EntryType" json:"Type"`
+	Data             []byte    `protobuf:"bytes,4,opt,name=Data" json:"Data,omitempty"`
+	XXX_unrecognized []byte    `json:"-"`
+}
+```
+
+3. Raft state chanes: pb.HardState。*SoftState算吗？
+
+```go
+type HardState struct {
+	Term             uint64 `protobuf:"varint,1,opt,name=term" json:"term"`
+	Vote             uint64 `protobuf:"varint,2,opt,name=vote" json:"vote"`
+	Commit           uint64 `protobuf:"varint,3,opt,name=commit" json:"commit"`
+	XXX_unrecognized []byte `json:"-"`
+}
+```
+
+// TODO：上文说的Message的input是指啥？ proposeC/confChangeC， 或者transport发送的消息？
+
+## 初始化Node
+
+> The primary object in raft is a Node. Either start a Node from scratch using raft.StartNode or start a Node from some initial state using raft.RestartNode.
+
+应用根据首次启动还是重启的不同，初始化Node的流程稍有不同。
+
+### 首次启动
+
+1. 创建`raft.Storage`对象
+1. 创建`raft.Config`，其中`Storage`指定为第1步创建的`raft.Storage`
+1. 通过`raft.StartNode(c, []raft.Peer{...})`创建`raft.Node`，其中c是第2步创建的`raft.Config`，另一个参数为集群其他成员的id。
+
+### 重启
+
+1. 创建`raft.Storage`对象
+1. 在`raft.Storage`对象中回放`snapshot`，`state`，`entries`
+2. 创建`raft.Config`，其中`Storage`指定为第1步创建的`raft.Storage`
+3. 通过`raft.RestartNode(c)`创建`raft.Node`，其中c是第2步创建的`raft.Config`，这里不再需要集群其他成员的id了，在`snapshot`或者`entries`中已经记录。
+
+### 创建raft.Storage
+
+`raft.Storage`是一个接口，
+
+## Reference
+[etcd raft library设计原理和使用](https://zhuanlan.zhihu.com/p/27767675)
