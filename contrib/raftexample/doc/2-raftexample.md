@@ -917,8 +917,8 @@ func (rc *raftNode) publishEntries(ents []raftpb.Entry) bool {
 
 - 判断的逻辑很简单，看看上一次做快照的日志`rc.snapshotIndex`和最新一条应用的日志`rc.appliedIndex`之间差了多少条日志，如果少于`rc.snapCount`这个常量则跳过
 - `data, err := rc.getSnapshot()`拿到应用当前的快照数据
-- `snap, err := rc.raftStorage.CreateSnapshot(rc.appliedIndex-1, &rc.confState, data)`不是很明白这一步在干什么，可能只是为了创建符合raftpb.Snapshot格式的快照。虽然说了很多次快照，但是做了多层封装后，不同层面快照的数据结构都不一样，跟tcp/ip的包一层套一层似的。
-- `rc.saveSnap(snap)`把保存这个快照，这个函数前面看过
+- `snap, err := rc.raftStorage.CreateSnapshot(rc.appliedIndex-1, &rc.confState, data)`这里主要是为了更新storage的快照，同时返回刚更新的快照。这里隐含了把快照的二进制数据封装为`raft snapshot`。不过index为什么是`applidIndex - 1`？
+- `rc.saveSnap(snap)`保存这个快照，这个函数前面看过
 - 好了，既然快照已经保存了，记再快照中的条目，就可以从raft 存储中`rc.raftStorage.Compact(compactIndex)`一些不再需要的数据 //TODO： compatIndex的计算没看懂.
   - compatcIndex 要么是1，如果rc.appliedIndex <= snapshotCatchUpEntriesN的话，
   - 要么是`compactIndex = rc.appliedIndex - snapshotCatchUpEntriesN`,如果`rc.appliedIndex > snapshotCatchUpEntriesN`的话，目前`snapshotCatchUpEntriesN`跟`rc.snapCount`这个常量的值相同
