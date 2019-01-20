@@ -2,7 +2,7 @@
 
  `raft.Storage`是一个接口，用来存取raft 日志，raft自带了一个`MemoryStorage`的实现，应用也可以提供自己的实现。
 
- //TODO；虽然这么说，可我还是不明白这玩意干啥的.
+ //TODO；虽然这么说，可我还是不明白这玩意干啥的。大概是在raft协议和应用角度的`raft server`之间做适配：应用层从raft协议获取的值需要更新到这个storage里面，这样raft协议知道目前应用层保存了什么，需要发什么过来。
 
  ## Raft Storage 接口
 
@@ -334,5 +334,17 @@ func (ms *MemoryStorage) CreateSnapshot(i uint64, cs *pb.ConfState, data []byte)
 	}
 	ms.snapshot.Data = data
 	return ms.snapshot, nil
+}
+```
+
+### 设置HardState
+
+```go
+// SetHardState saves the current HardState.
+func (ms *MemoryStorage) SetHardState(st pb.HardState) error {
+	ms.Lock()
+	defer ms.Unlock()
+	ms.hardState = st
+	return nil
 }
 ```

@@ -99,7 +99,43 @@ type Transport struct {
 }
 ```
 
-### 发送消息到多节点
+### Raft接口
+`Transport`中定义了一个`Raft`的接口
+
+```go
+type Raft interface {
+	Process(ctx context.Context, m raftpb.Message) error
+	IsIDRemoved(id uint64) bool
+	ReportUnreachable(id uint64)
+	ReportSnapshot(id uint64, status raft.SnapshotStatus)
+}
+```
+
+=
+`raftexample` 同样实现了这几个接口，注意`Process()`这个函数，收到消息后要求`rc.node.Step(ctx, m)`，这是在`startRaft()`中设置的：
+
+```go
+	rc.transport = &rafthttp.Transport{
+		Logger:      zap.NewExample(),
+		ID:          types.ID(rc.id),
+		ClusterID:   0x1000,
+		Raft:        rc,                 #<==== here
+		ServerStats: stats.NewServerStats("", ""),
+		LeaderStats: stats.NewLeaderStats(strconv.Itoa(rc.id)),
+		ErrorC:      make(chan error),
+	}
+```
+
+```go
+func (rc *raftNode) Process(ctx context.Context, m raftpb.Message) error {
+	return rc.node.Step(ctx, m)
+}
+func (rc *raftNode) IsIDRemoved(id uint64) bool                           { return false }
+func (rc *raftNode) ReportUnreachable(id uint64)                          {}
+func (rc *raftNode) ReportSnapshot(id uint64, status raft.SnapshotStatus) {}
+```
+
+### 发送消息到多节点
 
 在`exampleraft`的`serveChannels()`中，使用了`rc.transport.Send(rd.Messages)`来处理消息发。Message在raft/raftpb/raft.pb.go中定义：
 ```go

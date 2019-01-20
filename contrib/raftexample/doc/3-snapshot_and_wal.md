@@ -814,7 +814,7 @@ WAL中封装了几种常用类型的save方法，分别是
 - SaveSnapShot
 - saveState
 - saveEntry
-- 以及封装了saveState和saveEntry的Save方法
+- 以及封装了saveState和saveEntry的Save方法，注意先写entries,然后才是state，这是`etcd raft`所要求的，//TODO raft协议有要求这个吗？
 
 ```go
 func (w *WAL) saveState(s *raftpb.HardState) error {

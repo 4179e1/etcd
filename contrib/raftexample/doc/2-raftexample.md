@@ -426,9 +426,10 @@ func newRaftNode(id int, peers []string, join bool, getSnapshot func() ([]byte, 
 6. 根据是否首次启动(即第2步的`oldwal`)分为两个分支
     - 如果是首次启动，则传入配置c和初始成员`rpeers`，调用`raft.StartNode (c, peers)`初始化`rc.node`
     - 如果是重启，则只传入配置c，用`raft.RestartNode(c)`初始化`rc.node`，不需要rpeers，因为最新的集群成员信息已经保存在快照的metadata中或者WAL中(通过回放），并且跟原始成员相比可能已经发生了变化
-7. `rc.transport =&rafthttp.Transport{...}` 以及`rc.transport`分别创建和启动tcd的网络传输框架；下面的for循环中`rc.transport.AddPeer()`把所有其他成员添加到传输列表中。太复杂了需要单独一篇文章
-8. `go rc.serverRaft()` 启动raftx协议的监听端口，用于raft协议的内部通讯，见后文
-9. `go rc.serverChannels()` raft.go 真正的业务处理，在协程中监听用户请求、配置等命令
+7. `rc.transport =&rafthttp.Transport{...}`,其中`raft`字段是`transport`定义的接口，把`rc`给传进去了，因为我们实现了这个接口。
+8. 以及`rc.transport`分别创建和启动tcd的网络传输框架；下面的for循环中`rc.transport.AddPeer()`把所有其他成员添加到传输列表中。
+9. `go rc.serverRaft()` 启动raftx协议的监听端口，用于raft协议的内部通讯，见后文
+10. `go rc.serverChannels()` raft.go 真正的业务处理，在协程中监听用户请求、配置等命令
 
 
 ```go
