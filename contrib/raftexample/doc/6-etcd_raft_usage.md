@@ -365,5 +365,94 @@ func (rc *raftNode) Process(ctx context.Context, m raftpb.Message) error {
 
 `ticker := time.NewTicker(100 * time.Millisecond)`，然后在for select循环中处理超时`case <-rc.stopc:`
 
+
+### 总结
+
+> The total state machine handling loop will look something like this:
+
+```go
+  for {
+    select {
+    case <-s.Ticker:
+      n.Tick()
+    case rd := <-s.Node.Ready():
+      saveToStorage(rd.HardState, rd.Entries, rd.Snapshot)
+      send(rd.Messages)
+      if !raft.IsEmptySnap(rd.Snapshot) {
+        processSnapshot(rd.Snapshot)
+      }
+      for _, entry := range rd.CommittedEntries {
+        process(entry)
+        if entry.Type == raftpb.EntryConfChange {
+          var cc raftpb.ConfChange
+          cc.Unmarshal(entry.Data)
+          s.Node.ApplyConfChange(cc)
+        }
+      }
+      s.Node.Advance()
+    case <-s.done:
+      return
+    }
+  }
+```
+
+## 提交修改
+
+### 提交日志
+
+> To propose changes to the state machine from the node to take application data, serialize it into a byte slice and call:
+> 
+> ```go
+> 	n.Propose(ctx, data)
+> ```
+> 
+> If the proposal is committed, data will appear in committed entries with type raftpb.EntryNormal. There is no guarantee that a proposed command will be committed; the command may have to be reproposed after a timeout.
+
+完整的流程
+
+- client 发起`curl =X PUT http://<ip>:<port>/<key> -d <value>`
+- httpapi.go/ServeHTTP()
+- kvstore.go/Propose(): s.propose <- <encoded K,V>
+- raft.go/serveChannels(): prop, ok := <-rc.proposeC
+- node.go/Propose()
+
+
+### 配置变更
+
+> To add or remove node in a cluster, build ConfChange struct 'cc' and call:
+> 
+> ```go
+> 	n.ProposeConfChange(ctx, cc)
+> ```
+
+比如删除一个node
+
+- client: `curl -L http://<ip>:<port>/<node id> -XDELETE`
+- httpapi.go/ServeHTTP(): h.confChangeC <- cc
+- raft.go/serveChannels(): cc, ok := <-rc.confChangeC
+- node.go/ProposeConfChange()
+ 
+### 应用配置
+
+> After config change is committed, some committed entry with type raftpb.EntryConfChange will be returned. This must be applied to node through:
+> ```go
+> 	var cc raftpb.ConfChange
+> 	cc.Unmarshal(data)
+> 	n.ApplyConfChange(cc)
+> ```
+> 
+> Note: An ID represents a unique node in a cluster for all time. A given ID MUST be used only once even if the old node has been removed. This means that for example IP addresses make poor node IDs since they may be reused. Node IDs must be non-zero.
+
+`raftexample`的`publishEntries()`中：
+
+```go
+		case raftpb.EntryConfChange:
+			var cc raftpb.ConfChange
+			cc.Unmarshal(ents[i].Data)
+			rc.confState = *rc.node.ApplyConfChange(cc)
+			switch cc.Type {
+```
+
+
 ## Reference
 [etcd raft library设计原理和使用](https://zhuanlan.zhihu.com/p/27767675)
