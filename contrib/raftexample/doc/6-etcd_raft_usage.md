@@ -114,21 +114,24 @@ type HardState struct {
 
 ### 首次启动
 
-> startRaft(): 
-> |- replayWal():
-> |  |- 创建`raft.Storage`对象 (在`replyWAL()`中)
-> |  |- 在`raft.Storage`对象中回放`snapshot`(如果有的话)，`state`，`entries`()
-> |- 创建`raft.Config`，其中`Storage`指定为`replayWAL()`中创建的`raft.Storage`
-> |- . 通过`raft.StartNode(c, []raft.Peer{...})`创建`raft.Node`，其中c是第2步创建的`raft.Config`，另一个参数为集群其他成员的id。 ```
+startRaft(): 
+- replayWal():
+  - 创建`raft.Storage`对象 (在`replyWAL()`中)
+  - 在`raft.Storage`对象中回放`snapshot`(如果有的话)，`state`，`entries`()
+- 创建`raft.Config`，其中`Storage`指定为`replayWAL()`中创建的`raft.Storage`
+-  通过`raft.StartNode(c, []raft.Peer{...})`创建`raft.Node`，其中c是第2步创建的`raft.Config`，另一个参数为集群其他成员的id。 ```
+```
 
  ### 重启
 
-> startRaft(): 
-> |- replayWal():
-> |  |- 创建`raft.Storage`对象 (在`replyWAL()`中)
-> |  |- 在`raft.Storage`对象中回放`snapshot`(如果有的话)，`state`，`entries`()
-> |- 创建`raft.Config`，其中`Storage`指定为`replayWAL()`中创建的`raft.Storage`
-> |- 通过`raft.RestartNode(c)`创建`raft.Node`，其中c是第2步创建的`raft.Config`，这里不再需要集群其他成员的id了，在`snapshot`或者`entries`中已经记录。
+```
+startRaft(): 
+- replayWal():
+  - 创建`raft.Storage`对象 (在`replyWAL()`中)
+  - 在`raft.Storage`对象中回放`snapshot`(如果有的话)，`state`，`entries`()
+- 创建`raft.Config`，其中`Storage`指定为`replayWAL()`中创建的`raft.Storage`
+- 通过`raft.RestartNode(c)`创建`raft.Node`，其中c是第2步创建的`raft.Config`，这里不再需要集群其他成员的id了，在`snapshot`或者`entries`中已经记录。
+```
 
 ### 创建raft.Storage
 
