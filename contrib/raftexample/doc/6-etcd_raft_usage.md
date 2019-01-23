@@ -95,12 +95,57 @@ type Entry struct {
 
 3. Raft state chanes: pb.HardState。*SoftState算吗？
 
+`HardState`需要持久化，对应Raft论文中这一部分
+
+> Persistent state on all servers:
+> (Updated on stable storage before responding to RPCs)
+> 
+> - `currentTerm`: latest term server has seen (initialized to 0 on first boot, increases monotonically) 
+> - `votedFor`: candidateId that received vote in current term (or null if none)
+> - `log[]`: log entries; each entry contains command for state machine, and term when entry was received by leader (first index is 1)
+
+这里没有log[]，它实际在WAL中，但是多了一个`Commit`，可能是记录已经commit到哪一条entry
+
 ```go
 type HardState struct {
 	Term             uint64 `protobuf:"varint,1,opt,name=term" json:"term"`
 	Vote             uint64 `protobuf:"varint,2,opt,name=vote" json:"vote"`
 	Commit           uint64 `protobuf:"varint,3,opt,name=commit" json:"commit"`
 	XXX_unrecognized []byte `json:"-"`
+}
+```
+
+`SoftState`是易失的状态，包含lead信息和当前节点状态，不需要持久化
+
+```go
+// SoftState provides state that is useful for logging and debugging.
+// The state is volatile and does not need to be persisted to the WAL.
+type SoftState struct {
+	Lead      uint64 // must use atomic operations to access; keep 64-bit aligned.
+	RaftState StateType
+}
+
+// Possible values for StateType.
+const (
+	StateFollower StateType = iota
+	StateCandidate
+	StateLeader
+	StatePreCandidate
+	numStates
+)
+
+// StateType represents the role of a node in a cluster.
+type StateType uint64
+
+var stmap = [...]string{
+	"StateFollower",
+	"StateCandidate",
+	"StateLeader",
+	"StatePreCandidate",
+}
+
+func (st StateType) String() string {
+	return stmap[uint64(st)]
 }
 ```
 

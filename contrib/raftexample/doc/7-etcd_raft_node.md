@@ -127,7 +127,14 @@ func newNode() node {
 1. 调用`n := newNode()`创建node数据结构
 1. `go n.run(r)`进入协议的处理
 
-`StartNode()`要稍微复杂些，它在1和2之间需要把所有所有（TODO:这里包括自己？)peers作为配置变更提交到raft协议中。
+`StartNode()`要稍微复杂些，它在1和2之间：
+
+1. `r.becomeFollower(1, None)`把自己的状态设置为`follower`
+2. 以`Term 1`把所有（TODO:这里包括自己？)peers作为配置变更追加到raftLog中的，其中`Context: peer.Context`在`raftexample`中是一个未初始化的空值。这里应该是有个假设的前提--所有节点都会以同样的顺序添加这些配置信息，也就是它们传入的--peers参数是相同的。
+3. `r.raftLog.committed = r.raftLog.lastIndex()`把这些日志标记为`committed`，但是没有标记`applied`，这样后续应用层能从`Ready.CommittedEntries`中发现这些变更并应用
+4. 循环`r.addNode(peer.ID)`添加所有节点。注释中说这些节点会添加两次，第二次是应用看到这些配置变更并应用时(`raftexample`中的`rc.confState = *rc.node.ApplyConfChange(cc)`)
+
+以上步骤是初始化时的特例。
 
 ```go
 type Peer struct {
@@ -185,5 +192,144 @@ func RestartNode(c *Config) Node {
 	n.logger = c.Logger
 	go n.run(r)
 	return &n
+}
+```
+
+## node 主循环
+
+```go
+func (n *node) run(r *raft) {
+	var propc chan msgWithResult
+	var readyc chan Ready
+	var advancec chan struct{}
+	var prevLastUnstablei, prevLastUnstablet uint64
+	var havePrevLastUnstablei bool
+	var prevSnapi uint64
+	var applyingToI uint64
+	var rd Ready
+
+	lead := None
+	prevSoftSt := r.softState()
+	prevHardSt := emptyState
+
+	for {
+		if advancec != nil {
+			readyc = nil
+		} else {
+			rd = newReady(r, prevSoftSt, prevHardSt)
+			if rd.containsUpdates() {
+				readyc = n.readyc
+			} else {
+				readyc = nil
+			}
+		}
+
+		if lead != r.lead {
+			if r.hasLeader() {
+				if lead == None {
+					r.logger.Infof("raft.node: %x elected leader %x at term %d", r.id, r.lead, r.Term)
+				} else {
+					r.logger.Infof("raft.node: %x changed leader from %x to %x at term %d", r.id, lead, r.lead, r.Term)
+				}
+				propc = n.propc
+			} else {
+				r.logger.Infof("raft.node: %x lost leader %x at term %d", r.id, lead, r.Term)
+				propc = nil
+			}
+			lead = r.lead
+		}
+
+		select {
+		// TODO: maybe buffer the config propose if there exists one (the way
+		// described in raft dissertation)
+		// Currently it is dropped in Step silently.
+		case pm := <-propc:
+			m := pm.m
+			m.From = r.id
+			err := r.Step(m)
+			if pm.result != nil {
+				pm.result <- err
+				close(pm.result)
+			}
+		case m := <-n.recvc:
+			// filter out response message from unknown From.
+			if pr := r.getProgress(m.From); pr != nil || !IsResponseMsg(m.Type) {
+				r.Step(m)
+			}
+		case cc := <-n.confc:
+			if cc.NodeID == None {
+				select {
+				case n.confstatec <- pb.ConfState{
+					Nodes:    r.nodes(),
+					Learners: r.learnerNodes()}:
+				case <-n.done:
+				}
+				break
+			}
+			switch cc.Type {
+			case pb.ConfChangeAddNode:
+				r.addNode(cc.NodeID)
+			case pb.ConfChangeAddLearnerNode:
+				r.addLearner(cc.NodeID)
+			case pb.ConfChangeRemoveNode:
+				// block incoming proposal when local node is
+				// removed
+				if cc.NodeID == r.id {
+					propc = nil
+				}
+				r.removeNode(cc.NodeID)
+			case pb.ConfChangeUpdateNode:
+			default:
+				panic("unexpected conf type")
+			}
+			select {
+			case n.confstatec <- pb.ConfState{
+				Nodes:    r.nodes(),
+				Learners: r.learnerNodes()}:
+			case <-n.done:
+			}
+		case <-n.tickc:
+			r.tick()
+		case readyc <- rd:
+			if rd.SoftState != nil {
+				prevSoftSt = rd.SoftState
+			}
+			if len(rd.Entries) > 0 {
+				prevLastUnstablei = rd.Entries[len(rd.Entries)-1].Index
+				prevLastUnstablet = rd.Entries[len(rd.Entries)-1].Term
+				havePrevLastUnstablei = true
+			}
+			if !IsEmptyHardState(rd.HardState) {
+				prevHardSt = rd.HardState
+			}
+			if !IsEmptySnap(rd.Snapshot) {
+				prevSnapi = rd.Snapshot.Metadata.Index
+			}
+			if index := rd.appliedCursor(); index != 0 {
+				applyingToI = index
+			}
+
+			r.msgs = nil
+			r.readStates = nil
+			r.reduceUncommittedSize(rd.CommittedEntries)
+			advancec = n.advancec
+		case <-advancec:
+			if applyingToI != 0 {
+				r.raftLog.appliedTo(applyingToI)
+				applyingToI = 0
+			}
+			if havePrevLastUnstablei {
+				r.raftLog.stableTo(prevLastUnstablei, prevLastUnstablet)
+				havePrevLastUnstablei = false
+			}
+			r.raftLog.stableSnapTo(prevSnapi)
+			advancec = nil
+		case c := <-n.status:
+			c <- getStatus(r)
+		case <-n.stop:
+			close(n.done)
+			return
+		}
+	}
 }
 ```
