@@ -1,5 +1,130 @@
 # Etcd Raft Node 结构
 
+## Ready 
+
+### Ready 数据结构
+
+Ready是一个只读的结构，封装了那些可以用来读取、持久化、提交，或者发给别的节点的Entry或Message
+
+```go
+// Ready encapsulates the entries and messages that are ready to read,
+// be saved to stable storage, committed or sent to other peers.
+// All fields in Ready are read-only.
+type Ready struct {
+	// The current volatile state of a Node.
+	// SoftState will be nil if there is no update.
+	// It is not required to consume or store SoftState.
+	*SoftState
+
+	// The current state of a Node to be saved to stable storage BEFORE
+	// Messages are sent.
+	// HardState will be equal to empty state if there is no update.
+	pb.HardState
+
+	// ReadStates can be used for node to serve linearizable read requests locally
+	// when its applied index is greater than the index in ReadState.
+	// Note that the readState will be returned when raft receives msgReadIndex.
+	// The returned is only valid for the request that requested to read.
+	ReadStates []ReadState
+
+	// Entries specifies entries to be saved to stable storage BEFORE
+	// Messages are sent.
+	Entries []pb.Entry
+
+	// Snapshot specifies the snapshot to be saved to stable storage.
+	Snapshot pb.Snapshot
+
+	// CommittedEntries specifies entries to be committed to a
+	// store/state-machine. These have previously been committed to stable
+	// store.
+	CommittedEntries []pb.Entry
+
+	// Messages specifies outbound messages to be sent AFTER Entries are
+	// committed to stable storage.
+	// If it contains a MsgSnap message, the application MUST report back to raft
+	// when the snapshot has been received or has failed by calling ReportSnapshot.
+	Messages []pb.Message
+
+	// MustSync indicates whether the HardState and Entries must be synchronously
+	// written to disk or if an asynchronous write is permissible.
+	MustSync bool
+}
+```
+
+### Ready 初始化
+
+```go
+func isHardStateEqual(a, b pb.HardState) bool {
+	return a.Term == b.Term && a.Vote == b.Vote && a.Commit == b.Commit
+}
+
+// IsEmptyHardState returns true if the given HardState is empty.
+func IsEmptyHardState(st pb.HardState) bool {
+	return isHardStateEqual(st, emptyState)
+}
+
+// MustSync returns true if the hard state and count of Raft entries indicate
+// that a synchronous write to persistent storage is required.
+func MustSync(st, prevst pb.HardState, entsnum int) bool {
+	// Persistent state on all servers:
+	// (Updated on stable storage before responding to RPCs)
+	// currentTerm
+	// votedFor
+	// log entries[]
+	return entsnum != 0 || st.Vote != prevst.Vote || st.Term != prevst.Term
+}
+
+func newReady(r *raft, prevSoftSt *SoftState, prevHardSt pb.HardState) Ready {
+	rd := Ready{
+		Entries:          r.raftLog.unstableEntries(),
+		CommittedEntries: r.raftLog.nextEnts(),
+		Messages:         r.msgs,
+	}
+	if softSt := r.softState(); !softSt.equal(prevSoftSt) {
+		rd.SoftState = softSt
+	}
+	if hardSt := r.hardState(); !isHardStateEqual(hardSt, prevHardSt) {
+		rd.HardState = hardSt
+	}
+	if r.raftLog.unstable.snapshot != nil {
+		rd.Snapshot = *r.raftLog.unstable.snapshot
+	}
+	if len(r.readStates) != 0 {
+		rd.ReadStates = r.readStates
+	}
+	rd.MustSync = MustSync(r.hardState(), prevHardSt, len(rd.Entries))
+	return rd
+}
+```
+
+### Ready方法
+
+```go
+// IsEmptySnap returns true if the given Snapshot is empty.
+func IsEmptySnap(sp pb.Snapshot) bool {
+	return sp.Metadata.Index == 0
+}
+
+func (rd Ready) containsUpdates() bool {
+	return rd.SoftState != nil || !IsEmptyHardState(rd.HardState) ||
+		!IsEmptySnap(rd.Snapshot) || len(rd.Entries) > 0 ||
+		len(rd.CommittedEntries) > 0 || len(rd.Messages) > 0 || len(rd.ReadStates) != 0
+}
+
+// appliedCursor extracts from the Ready the highest index the client has
+// applied (once the Ready is confirmed via Advance). If no information is
+// contained in the Ready, returns zero.
+func (rd Ready) appliedCursor() uint64 {
+	if n := len(rd.CommittedEntries); n > 0 {
+		return rd.CommittedEntries[n-1].Index
+	}
+	if index := rd.Snapshot.Metadata.Index; index > 0 {
+		return index
+	}
+	return 0
+}
+```
+
 ## Node 接口
 
 `Node`代表raft 集群中的几个节点，它的接口如下
