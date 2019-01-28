@@ -24,6 +24,9 @@
     - Learners
     - 以上两个成员都是unit64的数组，大概表示成员的ID，怎么根据这个id找到实际的ip：port? 大概是根据启动时的`cluster`参数?
 
+> Raft also includes a small amount of metadata in the snapshot: the `last included index` is the index of the last entry in the log that the snapshot replaces (the last entry the state machine had applied), and the `last included term` is the term of this entry. 
+These are preserved to support the AppendEntries consistency check for the first log entry following the snapshot, since that entry needs a previous log index and term. To enable cluster membership changes (Section 6), the snapshot also includes the latest configuration in the log as of last included index. Once a server completes writing a snapshot, it may delete all log entries up through the last included index, as well as any prior snapshot.
+
 ```go
 type Snapshot struct {
 	Data             []byte           `protobuf:"bytes,1,opt,name=data" json:"data,omitempty"`
