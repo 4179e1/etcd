@@ -53,6 +53,11 @@ type Ready struct {
 
 ### Ready 初始化
 
+- 从`raft`结构中初始化`Entries`，`CommittedEntries`，以及`Messages`三个字段。
+- 如果`hardstate`或者`softstate`有更新，则更新这些字段
+- 同样，根据`raft`结构的内容更新snapshot和readStates
+- 最后更新MustSync，应用层需要检查这个值来判断是不是要持久化。
+
 ```go
 func isHardStateEqual(a, b pb.HardState) bool {
 	return a.Term == b.Term && a.Vote == b.Vote && a.Commit == b.Commit
@@ -98,6 +103,9 @@ func newReady(r *raft, prevSoftSt *SoftState, prevHardSt pb.HardState) Ready {
 ```
 
 ### Ready方法
+
+- `containsUpdates()`检查Ready是不是携带有更新
+- `appliedCursor()`返回已经applied的index（`node.Advance()`之后）
 
 ```go
 // IsEmptySnap returns true if the given Snapshot is empty.
@@ -249,8 +257,8 @@ func newNode() node {
 启动分为首次启动`StartNode()`和重启`RestartNode()`，两者都会：
 
 1. 调用`r := newRaft(c)`创建raft数据结构
-1. 调用`n := newNode()`创建node数据结构
-1. `go n.run(r)`进入协议的处理
+2. 调用`n := newNode()`创建node数据结构
+3. `go n.run(r)`进入协议的处理
 
 `StartNode()`要稍微复杂些，它在1和2之间：
 
@@ -321,6 +329,34 @@ func RestartNode(c *Config) Node {
 ```
 
 ## node 主循环
+
+主循环处理多个channel，其中`readyc` 进行发送，其他所有的channel都是负责接收的。
+`readyc`跟`advancec`是互斥的，如果`advancec`非`nil`，则readyc必须置`nil`；反之，当`advancec`为`nil`时，如果ready包含更新（`rd.containsUpdates()`），则设置`readyc = n.readyc`。
+来看看这个两个分支：　
+- `case readyc <- rd:`
+  - 首先通过多个prev变量记录当前的信息（下一次循环在别的处理逻辑来看就是prev了）
+    - `prevSoftSt = rd.SoftState`
+    - `prevLastUnstablei = rd.Entries[len(rd.Entries)-1].Index`
+    - `prevLastUnstablet = rd.Entries[len(rd.Entries)-1].Term`
+    - `prevHardSt = rd.HardState`
+    - `prevSnapi = rd.Snapshot.Metadata.Index`
+    - `index := rd.appliedCursor()`表示应用层（如果）applied这批更新的话，它的index会是什么。
+  - 置空raft结构中的msgs和readStates，并调用`r.reduceUncommittedSize(rd.CommittedEntries)`标记这些Entry已经commit // TODO，不太对劲，这个函数是干啥的？
+  - 最后设置`advancec = n.advancec`让主循环等待应用层处理完成（通过`node.Advance()`)
+- `case <-advancec:`
+  - `r.raftLog.appliedTo(applyingToI)`告诉raft协议这个index已经applied
+  - `r.raftLog.stableTo(prevLastUnstablei, prevLastUnstablet)`告诉raft协议应用层已经持久化这个index和term，可以认为是satable的。
+  - `r.raftLog.stableSnapTo(prevSnapi)`到目前为止的快照也可以认为是stable的
+  - 最后`advance =nil`等待下一批ready
+
+`readyc`和`advancec`的处理逻辑大概是这样的，`readyc`先发数据，然后在主循环中打开advancec（因此在循环开始会屏蔽自己）等待应用层处理并确认（`node.Advance()`)，确认完之后`advancec`会关闭，因此`readyc`可以接着发数据（如果有的话）。
+
+- `case pm := <-propc:`
+- `case m := <-n.recvc:`
+- `case cc := <-n.confc:`
+- `case <-n.tickc:`
+- `case c := <-n.status:`
+- `case <-n.stop:`
 
 ```go
 func (n *node) run(r *raft) {
