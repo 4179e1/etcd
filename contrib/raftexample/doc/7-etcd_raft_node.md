@@ -212,10 +212,7 @@ type Node interface {
 除了`logger`以外，所有的成员都是channel，其中只有`tickc`是有buffer的。
 
 ```go
-type msgWithResult struct {
-	m      pb.Message
-	result chan error
-}
+
 
 // node is the canonical implementation of the Node interface
 type node struct {
@@ -330,9 +327,13 @@ func RestartNode(c *Config) Node {
 
 ## node 主循环
 
-主循环处理多个channel，其中`readyc` 进行发送，其他所有的channel都是负责接收的。
-`readyc`跟`advancec`是互斥的，如果`advancec`非`nil`，则readyc必须置`nil`；反之，当`advancec`为`nil`时，如果ready包含更新（`rd.containsUpdates()`），则设置`readyc = n.readyc`。
-来看看这个两个分支：　
+主循环处理多个channel，其中`readyc` 进行发送，其他所有的channel都是负责接收的
+
+主循环的开始部分有两个检查
+
+一是设置互斥的`readyc`跟`advancec`，如果`advancec`非`nil`，则readyc必须置`nil`；反之，当`advancec`为`nil`时，如果ready包含更新（`rd.containsUpdates()`），则设置`readyc = n.readyc`。
+
+来看看后文中这个两个分支：　
 - `case readyc <- rd:`
   - 首先通过多个prev变量记录当前的信息（下一次循环在别的处理逻辑来看就是prev了）
     - `prevSoftSt = rd.SoftState`
@@ -349,9 +350,24 @@ func RestartNode(c *Config) Node {
   - `r.raftLog.stableSnapTo(prevSnapi)`到目前为止的快照也可以认为是stable的
   - 最后`advance =nil`等待下一批ready
 
-`readyc`和`advancec`的处理逻辑大概是这样的，`readyc`先发数据，然后在主循环中打开advancec（因此在循环开始会屏蔽自己）等待应用层处理并确认（`node.Advance()`)，确认完之后`advancec`会关闭，因此`readyc`可以接着发数据（如果有的话）。
+`readyc`和`advancec`的处理逻辑大概是这样的，`readyc`先发数据，然后在主循环中打开advancec（因此在循环开始会屏蔽自己）等待应用层处理并确认（`node.Advance()`)，确认完之后`advancec`会关闭，下一次循环开始时打开`readyc`，因此`readyc`可以接着发数据（如果有的话）。
 
+二是检查leader的状态变更，`lead`变量记录了之前leader的信息，如果leader发生了变化并且现在有leader，`propc = n.propc`打开`propc`以允许提交，否则关闭`propc`，就是下面这个分支：
 - `case pm := <-propc:`
+
+pm是一个带有回执的消息
+```go
+type msgWithResult struct {
+	m      pb.Message
+	result chan error
+}
+```
+  - `m := pm.m；m.From = r.id`设置发送人
+  - `err := r.Step(m)`提交给raft协议处理 //TODO，具体做了啥？
+  - 最后的if部分把消息处理结果发回去，官调pm的result channel通知发送者处理结果
+
+TODO：这消息是谁发来的？
+
 - `case m := <-n.recvc:`
 - `case cc := <-n.confc:`
 - `case <-n.tickc:`
@@ -385,15 +401,15 @@ func (n *node) run(r *raft) {
 			}
 		}
 
-		if lead != r.lead {
-			if r.hasLeader() {
-				if lead == None {
+		if lead != r.lead {  // leader发生了变化
+			if r.hasLeader() {  // raft协议现在有leader
+				if lead == None { // 之前没有leader，现在有了，说明新的leader选出来了
 					r.logger.Infof("raft.node: %x elected leader %x at term %d", r.id, r.lead, r.Term)
-				} else {
+				} else { // 之前有leader，现在有一个不同的leader，说明leader发生了变化
 					r.logger.Infof("raft.node: %x changed leader from %x to %x at term %d", r.id, lead, r.lead, r.Term)
 				}
 				propc = n.propc
-			} else {
+			} else { // 集群现在没leader
 				r.logger.Infof("raft.node: %x lost leader %x at term %d", r.id, lead, r.Term)
 				propc = nil
 			}
