@@ -362,17 +362,52 @@ type msgWithResult struct {
 	result chan error
 }
 ```
-  - `m := pm.m；m.From = r.id`设置发送人
-  - `err := r.Step(m)`提交给raft协议处理 //TODO，具体做了啥？
-  - 最后的if部分把消息处理结果发回去，官调pm的result channel通知发送者处理结果
 
-TODO：这消息是谁发来的？
+- `m := pm.m；m.From = r.id`设置发送人
+- `err := r.Step(m)`提交给raft协议处理 //TODO，具体做了啥？该函数的注释说`// Handle the message term, which may result in our stepping down to a follower.`
+- 最后的if部分把消息处理结果发回去，官调pm的result channel通知发送者处理结果
 
 - `case m := <-n.recvc:`
+
+// filter out response message from unknown From
+收到消息，如果不是响应类型（Msg*Resp)的消息，让raft协议去处理
+
 - `case cc := <-n.confc:`
+
+接收到配置变更
+- `if cc.NodeID == None`这一段貌似是没有节点状态的修改，只是把raft协议当前的Nodes和Learnder发送给`n.confstatec`，退出循环
+- 否则根据`cc.Type`执行不同的动作
+  - `pb.ConfChangeAddNode`调用`r.addNode(cc.NodeID)`添加节点
+  - `pb.ConfChangeAddLearnerNode`调用`r.addLearner(cc.NodeID)`添加learner
+  - `pb.ConfChangeRemoveNode`，如果移除的节点是自己，把propc置nil阻止提交，然后调用`r.removeNode(cc.NodeID)`移除节点。
+  - `pb.ConfChangeUpdateNode`啥也不做
+最后把更新过的配置发给`n.confstatec`处理
+
+
+```go
+type ConfChange struct {
+	ID               uint64        q `protobuf:"varint,1,opt,name=ID" json:"ID"`
+	Type             ConfChangeType `protobuf:"varint,2,opt,name=Type,enum=raftpb.ConfChangeType" json:"Type"`
+	NodeID           uint64         `protobuf:"varint,3,opt,name=NodeID" json:"NodeID"`
+	Context          []byte         `protobuf:"bytes,4,opt,name=Context" json:"Context,omitempty"`
+	XXX_unrecognized []byte         `json:"-"`
+}
+```
+
 - `case <-n.tickc:`
+
+直接让`r.tick()`处理
+
 - `case c := <-n.status:`
+
+执行`c <- getStatus(r)`,
+c是一个channel，类型为Status,`getStatus gets a copy of the current raft status.`
+
 - `case <-n.stop:`
+close(n.done)，用来退出循环
+
+
+Note： 这里任何可能阻塞的地方都会等待`n.done`，确保需要的时候可以停止循环。
 
 ```go
 func (n *node) run(r *raft) {
@@ -434,7 +469,7 @@ func (n *node) run(r *raft) {
 				r.Step(m)
 			}
 		case cc := <-n.confc:
-			if cc.NodeID == None {
+			if cc.NodeID == None { 
 				select {
 				case n.confstatec <- pb.ConfState{
 					Nodes:    r.nodes(),
@@ -507,6 +542,169 @@ func (n *node) run(r *raft) {
 			close(n.done)
 			return
 		}
+	}
+}
+```
+
+## Node 对外接口
+
+分成两类 
+- `Propose()`，`ProposeConfChange()`，`ApplyConfChange()`用来提交和应用变更
+- `Ready()`,`Advance()`,`Tick()`用在raft协议的处理
+
+### Propose() 
+
+`Propose()`用于提交请求，[](./2-raftexample.md)的`Raft 协议处理`描述了应用层的调用链。
+这个函数本质上是对`stepWithWaitOption()`的封装，直接看这个函数
+
+- 如果消息类型不是`pb.MsgProp`，则认为是收到一条消息，直接发给`n.recv`。这条消息在在`run()`循环的`case m := <-n.recvc:`中交给raft去处理
+- 否则认为是提交请求，发送给`n.proc`，在`run()`循环的`case pm := <-propc`中处理
+  - 如果不需要消息的处理结果，把messgae封装为`msgWithResult{m: m}`,`result`留空发给`n.proc`后直接返回nil。
+  - 如果要结果的话设置`result`字段，发给`n.proc`之后等待返回值。
+
+```go
+func (n *node) Propose(ctx context.Context, data []byte) error {
+	return n.stepWait(ctx, pb.Message{Type: pb.MsgProp, Entries: []pb.Entry{{Data: data}}})
+}
+
+func (n *node) stepWait(ctx context.Context, m pb.Message) error {
+	return n.stepWithWaitOption(ctx, m, true)
+}
+
+// Step advances the state machine using msgs. The ctx.Err() will be returned,
+// if any.
+func (n *node) stepWithWaitOption(ctx context.Context, m pb.Message, wait bool) error {
+	if m.Type != pb.MsgProp {
+		select {
+		case n.recvc <- m:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-n.done:
+			return ErrStopped
+		}
+	}
+	ch := n.propc
+	pm := msgWithResult{m: m}
+	if wait {
+		pm.result = make(chan error, 1)
+	}
+	select {
+	case ch <- pm:
+		if !wait {
+			return nil
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-n.done:
+		return ErrStopped
+	}
+	select {
+	case rsp := <-pm.result:
+		if rsp != nil {
+			return rsp
+		}
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-n.done:
+		return ErrStopped
+	}
+	return nil
+}
+```
+
+### ProposeConfChange()
+
+`ProposeConfChange()`同样是对`stepWithWaitOption()`的封装，最终还是会发给`n.propc`，两者殊途同归了。
+不同之处在于:
+
+- 忽略发给本地的消息
+- 不等待返回结果
+
+```go
+func (n *node) ProposeConfChange(ctx context.Context, cc pb.ConfChange) error {
+	data, err := cc.Marshal()
+	if err != nil {
+		return err
+	}
+	return n.Step(ctx, pb.Message{Type: pb.MsgProp, Entries: []pb.Entry{{Type: pb.EntryConfChange, Data: data}}})
+}
+
+func (n *node) Step(ctx context.Context, m pb.Message) error {
+	// ignore unexpected local messages receiving over network
+	if IsLocalMsg(m.Type) {
+		// TODO: return an error?
+		return nil
+	}
+	return n.step(ctx, m)
+}
+
+func IsLocalMsg(msgt pb.MessageType) bool {
+	return msgt == pb.MsgHup || msgt == pb.MsgBeat || msgt == pb.MsgUnreachable ||
+		msgt == pb.MsgSnapStatus || msgt == pb.MsgCheckQuorum
+}
+
+func (n *node) step(ctx context.Context, m pb.Message) error {
+	return n.stepWithWaitOption(ctx, m, false)
+}
+
+
+```
+
+### ApplyConfChange()
+
+这个函数时在应用层提交日志时执行的`publishEntries()`
+把配置变更的请求发给`n.confc`，在`run()`的`case cc := <-n.confc:`中处理完之后，把结果返回给应用层。
+
+```go
+func (n *node) ApplyConfChange(cc pb.ConfChange) *pb.ConfState {
+	var cs pb.ConfState
+	select {
+	case n.confc <- cc:
+	case <-n.done:
+	}
+	select {
+	case cs = <-n.confstatec:
+	case <-n.done:
+	}
+	return &cs
+}
+```
+
+### Ready()
+
+直接返回`n.readyc`让应用层去读取，见[](./6-etcd_raft_usage.md)
+
+```go
+func (n *node) Ready() <-chan Ready { return n.readyc }
+```
+
+### Advance()
+
+处理完毕可以读下一批数据
+
+```go
+func (n *node) Advance() {
+	select {
+	case n.advancec <- struct{}{}:
+	case <-n.done:
+	}
+}
+```
+
+### Tick()
+
+给raft协议的心跳
+
+```go
+// Tick increments the internal logical clock for this Node. Election timeouts
+// and heartbeat timeouts are in units of ticks.
+func (n *node) Tick() {
+	select {
+	case n.tickc <- struct{}{}:
+	case <-n.done:
+	default:
+		n.logger.Warningf("A tick missed to fire. Node blocks too long!")
 	}
 }
 ```

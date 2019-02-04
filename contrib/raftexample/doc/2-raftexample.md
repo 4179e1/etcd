@@ -652,9 +652,9 @@ func (h *httpHealth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 ```
 
-### Raft业务处理
+### Raft协议处理
 
-第9步正式进行Raft协议的业务处理
+第9步正式进行Raft协议处理
 
 - 首先根据快照的metadata更新结构体的`confState`， `snapshotIndex`， `appliedIndex`三个字段
 - `ticker := time.NewTicker(100 * time.Millisecond)`创建一个定时器
