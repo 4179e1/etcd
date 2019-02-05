@@ -1,6 +1,6 @@
 # Etcd Raft Node 结构
 
-## Ready 
+## Ready
 
 ### Ready 数据结构
 
@@ -264,7 +264,7 @@ func newNode() node {
 3. `r.raftLog.committed = r.raftLog.lastIndex()`把这些日志标记为`committed`，但是没有标记`applied`，这样后续应用层能从`Ready.CommittedEntries`中发现这些变更并应用
 4. 循环`r.addNode(peer.ID)`添加所有节点。注释中说这些节点会添加两次，第二次是应用看到这些配置变更并应用时(`raftexample`中的`rc.confState = *rc.node.ApplyConfChange(cc)`)
 
-以上步骤是初始化时的特例。
+这有点像raft thesis中提到的`we recommend that the very first time a cluster is created, one server is initialized with a configuration entry as the first entry in its log. This configuration lists only that one server; it alone forms a majority of its configuration, so it can consider this configuration committed.  Other servers from then on should be initialized with empty logs; they are added to the cluster and learn of the current configuration through the membership change mechanism.`
 
 ```go
 type Peer struct {

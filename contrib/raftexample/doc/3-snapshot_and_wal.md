@@ -2,6 +2,29 @@
 
 本文介绍ETCD的Snapshot和WAL实现，etcd中这两个组件是一定程度上耦合的，WAL依赖于snapshot。
 
+
+## Log Compaction
+
+Snapshot的目的是Log Compaction，日志是不断增长的，而磁盘空间是有限的。当一些日志不再需要的时候，它们就可以被丢弃了，比如状态机里面一开始把x设置2，之后把x设置为3，这是x=2的日志就可以丢弃了。处理这个问题的手段就是snapshot
+
+Raft Thesis根据状态机的不同实现讨论了几种的Log Compaction。
+
+### Memory Base State Machine
+
+状态机的数据都在内存中，直接从内存存取。这是最常见的方式，snapshot直接把内存数据序列化存到磁盘中，zookeeper和etcd都采用了这种方式。
+
+Note： 这种方式依然需要写磁盘做持久化。假设只存到内存，在整机房掉电的情况下，是没办法恢复的。因此log必须在磁盘中也需要保存一份，这就是WAL。WAL的作用跟etcd raft MemoryStorage是不同的。MemoryStorage保存的是raft协议的log entry；而WAL是用来重建MemoryStorage的log entry以及一些配置，状态相关的信息。
+
+### Disk Base State Machine
+
+状态机的数据直接存硬盘，一步到位，io也直接从硬盘存取，这种方式的问题在于性能比较差。snapshot有两种方式：`Log-Structured File System`和`Log Structured Merge Tree`。后者可以直接调用LevelDB，我厂的`PhxPaxos`底层就是直接用LevelDB存的。
+
+### Leader Based approach
+
+前面说的几种方法都是每个节点单独按照当前状态自行决定如何snapshot的。
+
+有一种比较取巧的方法是，直接把snpahost作为raft 协议的log entry发送给所有节点，这种实现可以简化很多设计，但是非常浪费带宽，在实践中并不可取。但是如果状态机的数据非常小，比如只有几MB，这种做法非常方便。
+
 ## Snapshot
 
 当我们说snapshot的时候，etcd里面其实有两个snapshot类型，它们都使用了`Protocol Buffers`:
