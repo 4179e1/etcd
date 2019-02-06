@@ -4,6 +4,19 @@
 
  //TODO；虽然这么说，可我还是不明白这玩意干啥的。大概是在raft协议和应用角度的`raft server`之间做适配：应用层从raft协议获取的值需要更新到这个storage里面，这样raft协议知道目前应用层保存了什么，需要发什么过来。
 
+ raft Config的注释说
+ ```
+ 	// Storage is the storage for raft. raft generates entries and states to be
+	// stored in storage. raft reads the persisted entries and states out of
+	// Storage when it needs. raft reads out the previous state and configuration
+	// out of storage when restarting.
+```	
+
+那么是三个功能
+- 把新的entry和state存到storage中
+- 需要的时候raft查询storage得知哪些entry和state已经持久化（当然这是状态机做的）
+- 重启的时候从里面回放（storage的重建来自WAL）
+
  ## Raft Storage 接口
 
  该接口要求实现6个方法，`etcd raft`内部会调用这些方法.

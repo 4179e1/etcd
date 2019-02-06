@@ -342,7 +342,14 @@ func RestartNode(c *Config) Node {
     - `prevHardSt = rd.HardState`
     - `prevSnapi = rd.Snapshot.Metadata.Index`
     - `index := rd.appliedCursor()`表示应用层（如果）applied这批更新的话，它的index会是什么。
-  - 置空raft结构中的msgs和readStates，并调用`r.reduceUncommittedSize(rd.CommittedEntries)`标记这些Entry已经commit // TODO，不太对劲，这个函数是干啥的？
+  - 置空raft结构中的msgs和readStates，并调用`r.reduceUncommittedSize(rd.CommittedEntries)`// 这个函数是干啥的？ raft数据结构的`uncommittedSize`字段的注释说：
+
+  ```go
+  	// an estimate of the size of the uncommitted tail of the Raft log. Used to
+	// prevent unbounded log growth. Only maintained by the leader. Reset on
+	// term changes
+  ```
+
   - 最后设置`advancec = n.advancec`让主循环等待应用层处理完成（通过`node.Advance()`)
 - `case <-advancec:`
   - `r.raftLog.appliedTo(applyingToI)`告诉raft协议这个index已经applied
