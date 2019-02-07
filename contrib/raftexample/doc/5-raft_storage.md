@@ -17,7 +17,9 @@
 - 需要的时候raft查询storage得知哪些entry和state已经持久化（当然这是状态机做的）
 - 重启的时候从里面回放（storage的重建来自WAL）
 
- ## Raft Storage 接口
+Node: Storage代表已持久化的log entry
+
+## Raft Storage 接口
 
  该接口要求实现6个方法，`etcd raft`内部会调用这些方法.
 

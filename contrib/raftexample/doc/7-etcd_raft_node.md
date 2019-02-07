@@ -715,3 +715,20 @@ func (n *node) Tick() {
 	}
 }
 ```
+
+## TODO raft结构需要关注的内容
+
+- Ready()
+  - r.softState()
+  - r.hardState()
+  - r.raftLog...
+  - r.msg...
+  - r.readStates
+- run()
+  - r.Step()
+  - r.getProgress()
+  - r.nodes()
+  - r.learnNodes()
+  - r.addNode()
+  - r.addLearner()
+  - r.reduceUncommittedSize()
