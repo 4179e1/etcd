@@ -173,10 +173,7 @@ type Config struct {
 
 Raft数据结构中封装了非常多的成员，其中一部分来自配置信息;一部分比较复杂的成员单独放到下一节详细描述;另一些我在行内直接注释。
 
-
-- ReadState 
-- state 
-- 
+> raft thesis 10.2.1 提出一种优化，在发送AppendEntry的同时进行持久化：To handle this simply, the leader uses its own match index to indicate the latest entry to have been durably written to its disk. Once an entry in the leader’s current term is covered by a majority of match indexes, the leader can advance its commit index. `matchedbuf` 是说的这个吗？
 
 ```go
 

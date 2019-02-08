@@ -564,8 +564,9 @@ func (n *node) run(r *raft) {
 `Propose()`用于提交请求，[](./2-raftexample.md)的`Raft 协议处理`描述了应用层的调用链。
 这个函数本质上是对`stepWithWaitOption()`的封装，直接看这个函数
 
-- 如果消息类型不是`pb.MsgProp`，则认为是收到一条消息，直接发给`n.recv`。这条消息在在`run()`循环的`case m := <-n.recvc:`中交给raft去处理
-- 否则认为是提交请求，发送给`n.proc`，在`run()`循环的`case pm := <-propc`中处理
+- 如果消息类型不是`pb.MsgProp`，则认为是收到一条消息
+  - 直接发给`n.recv`。这条消息在在`run()`循环的`case m := <-n.recvc:`中交给raft去处理
+- 否则认为对于`pb.MsgProp`，发送给`n.proc`，在`run()`循环的`case pm := <-propc`中处理
   - 如果不需要消息的处理结果，把messgae封装为`msgWithResult{m: m}`,`result`留空发给`n.proc`后直接返回nil。
   - 如果要结果的话设置`result`字段，发给`n.proc`之后等待返回值。
 
@@ -654,8 +655,16 @@ func IsLocalMsg(msgt pb.MessageType) bool {
 func (n *node) step(ctx context.Context, m pb.Message) error {
 	return n.stepWithWaitOption(ctx, m, false)
 }
+```
 
+### ReadIndex()
 
+最终会调用stepWithWaitOption，发给recvc, 调用 raft.step()来处理。 //TODO，这干啥的？项目中似乎没用到
+
+```go
+func (n *node) ReadIndex(ctx context.Context, rctx []byte) error {
+	return n.step(ctx, pb.Message{Type: pb.MsgReadIndex, Entries: []pb.Entry{{Data: rctx}}})
+}
 ```
 
 ### ApplyConfChange()
