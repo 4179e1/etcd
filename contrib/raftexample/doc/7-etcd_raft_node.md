@@ -259,7 +259,7 @@ func newNode() node {
 
 `StartNode()`要稍微复杂些，它在1和2之间：
 
-1. `r.becomeFollower(1, None)`把自己的状态设置为`follower`
+1. `r.becomeFollower(1, None)`，设置自己为follower，term为1, leader为`None(unit64 0)`
 2. 以`Term 1`把所有（TODO:这里包括自己？)peers作为配置变更追加到raftLog中的，其中`Context: peer.Context`在`raftexample`中是一个未初始化的空值。这里应该是有个假设的前提--所有节点都会以同样的顺序添加这些配置信息，也就是它们传入的--peers参数是相同的。
 3. `r.raftLog.committed = r.raftLog.lastIndex()`把这些日志标记为`committed`，但是没有标记`applied`，这样后续应用层能从`Ready.CommittedEntries`中发现这些变更并应用
 4. 循环`r.addNode(peer.ID)`添加所有节点。注释中说这些节点会添加两次，第二次是应用看到这些配置变更并应用时(`raftexample`中的`rc.confState = *rc.node.ApplyConfChange(cc)`)
@@ -377,7 +377,7 @@ type msgWithResult struct {
 - `case m := <-n.recvc:`
 
 // filter out response message from unknown From
-收到消息，如果不是响应类型（Msg*Resp)的消息，让raft协议去处理
+收到消息，如果不是响应类型（Msg*Resp)的消息，让`r.Step(m)`去处理
 
 - `case cc := <-n.confc:`
 

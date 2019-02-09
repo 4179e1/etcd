@@ -22,49 +22,20 @@
 上面设置的：
 
 - `Applied`当前已经apply的值，只有在重启时可以设置。但是否设置要看应用的需求
-- `MaxSizePerMsg`消息最大的长度，上面是1mb
+- `MaxSizePerMsg`每条消息最大的长度，上面是1mb
 - `MaxUncommittedEntriesSize`raft leader能保存的未提交log的总大小，上面是1GB（1 << 30)
-- `MaxInflightMsgs`貌似是etcd的优化，用来限制正在进行的log replication的总数
+- `MaxInflightMsgs`用来限制正在进行的log replication的总数
 
 一些值得注意的：
 
-- `CheckQuorum`， TODO， 似乎是etcd的扩展，让leader定时检查quorum确定自己是否还合法
-- `PreVOte`, raft thesis的PreVote扩展，用来处理节点出现网络分区后重新加入集群导致的干扰。
+- `MaxCommittedSizePerReady`: 一次ready最多能apply多大的大小？
+- `CheckQuorum`， raft thesis 6.2 节，让leader定时检查quorum确定自己是否还合法
+- `PreVote`, raft thesis 9.6节，用来避免节点出现网络分区后重新加入集群导致的干扰。
 - `Logger`，（debug用的）日志类
 - `DisableProposalForwarding`,是否允许follower把propesal请求转发给leader，在特定的场合有用。
-- `ReadOnlyOption`，读请求是否要先征求多数派，可选项包括
-  - `ReadOnlySafe` 通过征求多数派满足线性一致性
-  - `ReadOnlyLeaseBased` 通过lease机制返回数据，我猜满足顺序一致性，但不满足线性一致性。
-
-它们对应etcd raft feature所说的
-```
-    Efficient linearizable read-only queries served by both the leader and followers
-        leader checks with quorum and bypasses Raft log before processing read-only queries
-        followers asks leader to get a safe read index before processing read-only queries
-    More efficient lease-based linearizable read-only queries served by both the leader and followers
-        leader bypasses Raft log and processing read-only queries locally
-        followers asks leader to get a safe read index before processing read-only queries
-        this approach relies on the clock of the all the machines in raft group
-```
-
-```go
-type ReadOnlyOption int
-
-const (
-	// ReadOnlySafe guarantees the linearizability of the read only request by
-	// communicating with the quorum. It is the default and suggested option.
-	ReadOnlySafe ReadOnlyOption = iota
-	// ReadOnlyLeaseBased ensures linearizability of the read only request by
-	// relying on the leader lease. It can be affected by clock drift.
-	// If the clock drift is unbounded, leader might keep the lease longer than it
-	// should (clock can move backward/pause without any bound). ReadIndex is not safe
-	// in that case.
-	ReadOnlyLeaseBased
-)
-```
 
 另外一些私有成员
-- `peers`只有在初次启动时设置（在`raft.StartNode()`中）,否则会panic
+- `peers` 这东西是用来测试的，别用。只有在初次启动时设置（在`raft.StartNode()`中）,否则会panic
 - `learners`可以理解为raft的not voting member
 
 `validate()`用于校验Config的合法性，并尝试修复。
@@ -173,10 +144,18 @@ type Config struct {
 
 Raft数据结构中封装了非常多的成员，其中一部分来自配置信息;一部分比较复杂的成员单独放到下一节详细描述;另一些我在行内直接注释。
 
-> raft thesis 10.2.1 提出一种优化，在发送AppendEntry的同时进行持久化：To handle this simply, the leader uses its own match index to indicate the latest entry to have been durably written to its disk. Once an entry in the leader’s current term is covered by a majority of match indexes, the leader can advance its commit index. `matchedbuf` 是说的这个吗？
+- matchedbuf
+是这个吗？
+> raft thesis 10.2.1 提出一种优化，在发送AppendEntry的同时进行持久化：To handle this simply, the leader uses its own match index to indicate the latest entry to have been durably written to its disk. Once an entry in the leader’s current term is covered by a majority of match indexes, the leader can advance its commit index. 
+
+- pendingConfIndex
+etcd raft对成员变更的变种实现
+> To ensure there is no attempt to commit two membership changes at once by matching log positions (which would be unsafe since they should have different quorum requirements), any proposed membership change is simply disallowed while any uncommitted change appears in the leader's log.
+
+- tick/step
+这是两个没有初始化的函数指针，他们是在状态转换，比如`becomeLeader()`的时候设置的，不同的角色需要执行的动作不同
 
 ```go
-
 // Possible values for StateType.
 const (
 	StateFollower StateType = iota
@@ -200,9 +179,9 @@ type raft struct {
 	maxMsgSize         uint64		// 由Config初始化
 	maxUncommittedSize uint64		// 由Config初始化
 	maxInflight        int			// 由Config初始化
-	prs                map[uint64]*Progress  // ？？？
-	learnerPrs         map[uint64]*Progress  // ？？？
-	matchBuf           uint64Slice			// 记录每一个node match index
+	prs                map[uint64]*Progress  // 集群成员AE rpc的进度（match, next)，由leader维护
+	learnerPrs         map[uint64]*Progress  // non voting member的进度
+	matchBuf           uint64Slice			// 见section开始部分的说明
 
 	state StateType  // 当前状态，leader，follower，candidate，这里还有一个额外的pre-candidate
 
@@ -217,7 +196,7 @@ type raft struct {
 	lead uint64 
 	// leadTransferee is id of the leader transfer target when its value is not zero.
 	// Follow the procedure defined in raft thesis 3.10.
-	leadTransferee uint64
+	leadTransferee uint64  //被转移的对象
 	// Only one conf change may be pending (in the log, but not yet
 	// applied) at a time. This is enforced via pendingConfIndex, which
 	// is set to a value >= the log index of the latest pending
@@ -230,7 +209,7 @@ type raft struct {
 	// term changes.
 	uncommittedSize uint64
 
-	readOnly *readOnly 	// TODO
+	readOnly *readOnly 	// readonly 结构
 
 	// number of ticks since it reached last electionTimeout when it is leader
 	// or candidate.
@@ -253,8 +232,8 @@ type raft struct {
 	randomizedElectionTimeout int  // 根据electiontimout算出一个随机的超时时间
 	disableProposalForwarding bool   // 由Config初始化
 
-	tick func()				// TODO
-	step stepFunc			// TODO
+	tick func()				//
+	step stepFunc			// 
 
 	logger Logger			// 由Config初始化
 }
@@ -353,5 +332,300 @@ func newRaft(c *Config) *raft {
 	r.logger.Infof("newRaft %x [peers: [%s], term: %d, commit: %d, applied: %d, lastindex: %d, lastterm: %d]",
 		r.id, strings.Join(nodesStrs, ","), r.Term, r.raftLog.committed, r.raftLog.applied, r.raftLog.lastIndex(), r.raftLog.lastTerm())
 	return r
+}
+```
+
+## Progress相关 
+
+获取peer的Progess，同时可以用来检查某个id是不是在voter或者learner中
+
+```go
+func (r *raft) getProgress(id uint64) *Progress {
+	if pr, ok := r.prs[id]; ok {
+		return pr
+	}
+
+	return r.learnerPrs[id]
+}
+```
+
+这是新建progress？
+
+- 如果是learner，给`r.learnerPrs`对应的id新建Progrss
+- 如果不是，尝试把它从`r.learnerPrs`中删除，然后给`r.Prs`对应的id新建Progress
+
+> learner 可以转换为 voter
+> voter 不能转换为 learner
+> 一个id要么是voter，要么是learner，要么都不是
+
+```go
+func (r *raft) setProgress(id, match, next uint64, isLearner bool) {
+	if !isLearner {
+		delete(r.learnerPrs, id)
+		r.prs[id] = &Progress{Next: next, Match: match, ins: newInflights(r.maxInflight)}
+		return
+	}
+
+	if _, ok := r.prs[id]; ok {
+		panic(fmt.Sprintf("%x unexpected changing from voter to learner for %x", r.id, id))
+	}
+	r.learnerPrs[id] = &Progress{Next: next, Match: match, ins: newInflights(r.maxInflight), IsLearner: true}
+}
+```
+
+直接从prs和learnerPrs删掉就是了
+
+```go
+func (r *raft) delProgress(id uint64) {
+	delete(r.prs, id)
+	delete(r.learnerPrs, id)
+}
+```
+
+为每一个voter和learner执行函数f ，参数id和pr是当前的id和Progress
+
+```go
+func (r *raft) forEachProgress(f func(id uint64, pr *Progress)) {
+	for id, pr := range r.prs {
+		f(id, pr)
+	}
+
+	for id, pr := range r.learnerPrs {
+		f(id, pr)
+	}
+}
+```
+
+## 添加节点
+
+添加节点本身很简单
+- 如果不存在，调用`setProgress()`新建一个就是,match设置为0, next设置为`r.raftLog.lastIndex()+1`
+- 如果存在的话，就涉及到状态转换了，前面说过
+  - 不能从voter转换为learner
+  - 可以从learner转为voter，直接复用原来的Progress就行，不过得吧isLearner值为false
+  - 如果状态相同`if isLearner == pr.IsLearner`,那就是初次启动的时候重复添加了，忽略就行
+- 如果添加的id是自己，设置一下自己的isLearner状态
+- 最后更新pr.RecentActive = true，防止`CheckQuorum()`失败——我们加了一个node耶
+
+```go
+func (r *raft) addNode(id uint64) {
+	r.addNodeOrLearnerNode(id, false)
+}
+
+func (r *raft) addLearner(id uint64) {
+	r.addNodeOrLearnerNode(id, true)
+}
+
+func (r *raft) addNodeOrLearnerNode(id uint64, isLearner bool) {
+	pr := r.getProgress(id)
+	if pr == nil {
+		r.setProgress(id, 0, r.raftLog.lastIndex()+1, isLearner)
+	} else {
+		if isLearner && !pr.IsLearner {
+			// can only change Learner to Voter
+			r.logger.Infof("%x ignored addLearner: do not support changing %x from raft peer to learner.", r.id, id)
+			return
+		}
+
+		if isLearner == pr.IsLearner {
+			// Ignore any redundant addNode calls (which can happen because the
+			// initial bootstrapping entries are applied twice).
+			return
+		}
+
+		// change Learner to Voter, use origin Learner progress
+		delete(r.learnerPrs, id)
+		pr.IsLearner = false
+		r.prs[id] = pr
+	}
+
+	if r.id == id {
+		r.isLearner = isLearner
+	}
+
+	// When a node is first added, we should mark it as recently active.
+	// Otherwise, CheckQuorum may cause us to step down if it is invoked
+	// before the added node has a chance to communicate with us.
+	pr = r.getProgress(id)
+	pr.RecentActive = true
+}
+```
+
+## 删除节点
+
+删完节点之后要做的两个额外处理
+
+TODO:下列函数的实现
+- 现在quorum变小了，看看是不是能commit了`r.maybeCommit()`，是的话`r.bcastAppend()`
+- 如果我是leader并且被删除的是leader transfer的目标，`r.abortLeaderTransfer()`
+
+```go
+func (r *raft) removeNode(id uint64) {
+	r.delProgress(id)
+
+	// do not try to commit or abort transferring if there is no nodes in the cluster.
+	if len(r.prs) == 0 && len(r.learnerPrs) == 0 {
+		return
+	}
+
+	// The quorum size is now smaller, so see if any pending entries can
+	// be committed.
+	if r.maybeCommit() {
+		r.bcastAppend()
+	}
+	// If the removed node is the leadTransferee, then abort the leadership transferring.
+	if r.state == StateLeader && r.leadTransferee == id {
+		r.abortLeaderTransfer()
+	}
+}
+```
+
+## 随机超时器
+
+```go
+// pastElectionTimeout returns true iff r.electionElapsed is greater
+// than or equal to the randomized election timeout in
+// [electiontimeout, 2 * electiontimeout - 1].
+func (r *raft) pastElectionTimeout() bool {
+	return r.electionElapsed >= r.randomizedElectionTimeout
+}
+
+func (r *raft) resetRandomizedElectionTimeout() {
+	r.randomizedElectionTimeout = r.electionTimeout + globalRand.Intn(r.electionTimeout)
+}
+
+// lockedRand is a small wrapper around rand.Rand to provide
+// synchronization among multiple raft groups. Only the methods needed
+// by the code are exposed (e.g. Intn).
+type lockedRand struct {
+	mu   sync.Mutex
+	rand *rand.Rand
+}
+
+func (r *lockedRand) Intn(n int) int {
+	r.mu.Lock()
+	v := r.rand.Intn(n)
+	r.mu.Unlock()
+	return v
+}
+
+var globalRand = &lockedRand{
+	rand: rand.New(rand.NewSource(time.Now().UnixNano())),
+}
+```
+
+## 状态转换
+
+`reset()`需要一个term参数，重置现在的状态
+- 如果term发生了变化，重置Vote，否则保留
+- 重置各种计数器
+- 取消leadertransfer
+- 重置每一个voter/learner的Progress状态
+
+```go
+func (r *raft) reset(term uint64) {
+	if r.Term != term {
+		r.Term = term
+		r.Vote = None
+	}
+	r.lead = None
+
+	r.electionElapsed = 0
+	r.heartbeatElapsed = 0
+	r.resetRandomizedElectionTimeout()
+
+	r.abortLeaderTransfer()
+
+	r.votes = make(map[uint64]bool)
+	r.forEachProgress(func(id uint64, pr *Progress) {
+		*pr = Progress{Next: r.raftLog.lastIndex() + 1, ins: newInflights(r.maxInflight), IsLearner: pr.IsLearner}
+		if id == r.id {
+			pr.Match = r.raftLog.lastIndex()
+		}
+	})
+
+	r.pendingConfIndex = 0
+	r.uncommittedSize = 0
+	r.readOnly = newReadOnly(r.readOnly.option)
+}
+```
+
+`becomeFollower()`比较简单，`reset()`并且设置
+- `step`,`tick`两个函数指针
+- `state` 为`StateFollower`
+- lead，新的leader，可能为None
+
+```go
+func (r *raft) becomeFollower(term uint64, lead uint64) {
+	r.step = stepFollower
+	r.reset(term)
+	r.tick = r.tickElection
+	r.lead = lead
+	r.state = StateFollower
+	r.logger.Infof("%x became follower at term %d", r.id, r.Term)
+}
+
+func (r *raft) becomeCandidate() {
+	// TODO(xiangli) remove the panic when the raft implementation is stable
+	if r.state == StateLeader {
+		panic("invalid transition [leader -> candidate]")
+	}
+	r.step = stepCandidate
+	r.reset(r.Term + 1)
+	r.tick = r.tickElection
+	r.Vote = r.id
+	r.state = StateCandidate
+	r.logger.Infof("%x became candidate at term %d", r.id, r.Term)
+}
+
+func (r *raft) becomePreCandidate() {
+	// TODO(xiangli) remove the panic when the raft implementation is stable
+	if r.state == StateLeader {
+		panic("invalid transition [leader -> pre-candidate]")
+	}
+	// Becoming a pre-candidate changes our step functions and state,
+	// but doesn't change anything else. In particular it does not increase
+	// r.Term or change r.Vote.
+	r.step = stepCandidate
+	r.votes = make(map[uint64]bool)
+	r.tick = r.tickElection
+	r.state = StatePreCandidate
+	r.logger.Infof("%x became pre-candidate at term %d", r.id, r.Term)
+}
+
+func (r *raft) becomeLeader() {
+	// TODO(xiangli) remove the panic when the raft implementation is stable
+	if r.state == StateFollower {
+		panic("invalid transition [follower -> leader]")
+	}
+	r.step = stepLeader
+	r.reset(r.Term)
+	r.tick = r.tickHeartbeat
+	r.lead = r.id
+	r.state = StateLeader
+	// Followers enter replicate mode when they've been successfully probed
+	// (perhaps after having received a snapshot as a result). The leader is
+	// trivially in this state. Note that r.reset() has initialized this
+	// progress with the last index already.
+	r.prs[r.id].becomeReplicate()
+
+	// Conservatively set the pendingConfIndex to the last index in the
+	// log. There may or may not be a pending config change, but it's
+	// safe to delay any future proposals until we commit all our
+	// pending log entries, and scanning the entire tail of the log
+	// could be expensive.
+	r.pendingConfIndex = r.raftLog.lastIndex()
+
+	emptyEnt := pb.Entry{Data: nil}
+	if !r.appendEntry(emptyEnt) {
+		// This won't happen because we just called reset() above.
+		r.logger.Panic("empty entry was dropped")
+	}
+	// As a special case, don't count the initial empty entry towards the
+	// uncommitted log quota. This is because we want to preserve the
+	// behavior of allowing one entry larger than quota if the current
+	// usage is zero.
+	r.reduceUncommittedSize([]pb.Entry{emptyEnt})
+	r.logger.Infof("%x became leader at term %d", r.id, r.Term)
 }
 ```

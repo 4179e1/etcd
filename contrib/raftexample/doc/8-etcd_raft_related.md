@@ -540,7 +540,7 @@ func (l *raftLog) appliedTo(i uint64) {
 }
 ```
 
-这两函数就是对unstable的简单封装
+这两函数就是对unstable的简单封装，注意node每次处理advanc都会调用`stableSnapTo()`
 
 ```go
 func (l *raftLog) stableTo(i, t uint64) { l.unstable.stableTo(i, t) }
@@ -664,6 +664,8 @@ Progress表示每一个peer或者learner当前的进度(从leader的角度),设�
 
 
 - Match/Next: 对应raft 论文Figure2 中`Volatile state on leaders`中的`nextIndex[]`和`matchIndex[]`
+> 为什么要维护match 和 next 两个变量呢？ 为了batch append，只维护一个的话就要发一个等一个
+
 - State 是下面三者之一
 ```go
 const (
@@ -920,8 +922,6 @@ func (pr *Progress) IsPaused() bool {
 ### 更新Match和Next
 
 `maybeUpdated()`在AE rpc成功之后更新Match和Next
-`maybeDecrTo()`在AE rpc失败之后，更新Next
-- 有几处返回false的地方是因为这个Reject是过时的，reject的index在match之前了(比如重传)
 
 > 0 <= match < next <= lastindex
 
@@ -942,7 +942,13 @@ func (pr *Progress) maybeUpdate(n uint64) bool {
 }
 
 func (pr *Progress) optimisticUpdate(n uint64) { pr.Next = n + 1 }
+```
 
+`maybeDecrTo()`在AE rpc失败之后，更新Next
+- 有几处返回false的地方是因为这个Reject是过时的，reject的index在match之前了(比如重传)
+- raft 调用这个函数时last传入的参数是`m.RejectHint`，follower知道的第一条confilt的log index
+
+```go
 // maybeDecrTo returns false if the given to index comes from an out of order message.
 // Otherwise it decreases the progress next index to min(rejected, last) and returns true.
 func (pr *Progress) maybeDecrTo(rejected, last uint64) bool {
@@ -983,3 +989,191 @@ func (pr *Progress) needSnapshotAbort() bool {
 ```
 
 ## readOnly
+
+raft thesis 6.4 讨论的只读查询，不需要append log。
+
+为什么readonly 要单独拎出来说？ 因为写请求总是要写log征求多数派的同意，因此写请求在成功之后总是最新的。
+而只读请求本质上不需要写log，但是如果不征求多数派的意见，有可能leader返回的数据是旧的，比如leader跟多数派peer存在网络分区，已经有个新的leader选出来了。
+
+> 为了提高效率，可以积累若干readonly 请求再回复，但是考虑这个场景：
+index 100: client1 read x
+index 101: client2 write x+=1 
+		   client1 read x
+		   
+		   
+apply index到了100的时候就要回复client1,
+apply index到了101的时候要再次回复client1,并且是不同的值
+
+### readOnly数据结构
+
+readonly使用string类型来识别它的元素-同时使用了map和slice来索引，
+- readIndexQueue: slice确保key的顺序
+- pendingReadIndex: map用来索引和实际存储元素
+
+readIndexStatus包含三个成员
+- req  : 原始的请求消息
+- index：收到readonly请求时raft的commit index
+- acks ：记录从peers受到的回复
+
+```go
+type readIndexStatus struct {
+	req   pb.Message
+	index uint64
+	acks  map[uint64]struct{}
+}
+
+type readOnly struct {
+	option           ReadOnlyOption
+	pendingReadIndex map[string]*readIndexStatus
+	readIndexQueue   []string
+}
+
+func newReadOnly(option ReadOnlyOption) *readOnly {
+	return &readOnly{
+		option:           option,
+		pendingReadIndex: make(map[string]*readIndexStatus),
+	}
+}
+```
+
+其中`ReadOnlyOption`在raft.go中定义 -- 读请求是否要先征求多数派，可选项包括
+
+- `ReadOnlySafe` 通过征求多数派满足线性一致性
+- `ReadOnlyLeaseBased` 通过lease机制返回数据，我猜满足顺序一致性，但不满足线性一致性。
+
+它们对应etcd raft feature所说的
+```
+    Efficient linearizable read-only queries served by both the leader and followers
+        leader checks with quorum and bypasses Raft log before processing read-only queries
+        followers asks leader to get a safe read index before processing read-only queries
+    More efficient lease-based linearizable read-only queries served by both the leader and followers
+        leader bypasses Raft log and processing read-only queries locally
+        followers asks leader to get a safe read index before processing read-only queries
+        this approach relies on the clock of the all the machines in raft group
+```
+
+```go
+type ReadOnlyOption int
+
+const (
+	// ReadOnlySafe guarantees the linearizability of the read only request by
+	// communicating with the quorum. It is the default and suggested option.
+	ReadOnlySafe ReadOnlyOption = iota
+	// ReadOnlyLeaseBased ensures linearizability of the read only request by
+	// relying on the leader lease. It can be affected by clock drift.
+	// If the clock drift is unbounded, leader might keep the lease longer than it
+	// should (clock can move backward/pause without any bound). ReadIndex is not safe
+	// in that case.
+	ReadOnlyLeaseBased
+)
+```
+
+### ReadOnly方法
+
+添加readonly，message第一条entry的data被当作index来使用
+
+```go
+// addRequest adds a read only reuqest into readonly struct.
+// `index` is the commit index of the raft state machine when it received
+// the read only request.
+// `m` is the original read only request message from the local or remote node.
+func (ro *readOnly) addRequest(index uint64, m pb.Message) {
+	ctx := string(m.Entries[0].Data)
+	if _, ok := ro.pendingReadIndex[ctx]; ok {
+		return
+	}
+	ro.pendingReadIndex[ctx] = &readIndexStatus{index: index, req: m, acks: make(map[uint64]struct{})}
+	ro.readIndexQueue = append(ro.readIndexQueue, ctx)
+}
+```
+
+在收到心跳的回复之后，recvAck在收到回复之后往acks对应的peer里面插入一个空的struct，并返回新的长度
+// TODO这里的key 怎么变成m.Context了？
+
+```go
+// recvAck notifies the readonly struct that the raft state machine received
+// an acknowledgment of the heartbeat that attached with the read only request
+// context.
+func (ro *readOnly) recvAck(m pb.Message) int {
+	rs, ok := ro.pendingReadIndex[string(m.Context)]
+	if !ok {
+		return 0
+	}
+
+	rs.acks[m.From] = struct{}{}
+	// add one to include an ack from local node
+	return len(rs.acks) + 1
+}
+```
+
+Advance 让readonly推进到匹配的context，
+
+- rss保存匹配的（以及之前的）readIndexStatus
+- 当匹配的时候，把rss中的内容从readonly中删除
+
+```go
+// advance advances the read only request queue kept by the readonly struct.
+// It dequeues the requests until it finds the read only request that has
+// the same context as the given `m`.
+func (ro *readOnly) advance(m pb.Message) []*readIndexStatus {
+	var (
+		i     int
+		found bool
+	)
+
+	ctx := string(m.Context)
+	rss := []*readIndexStatus{}
+
+	for _, okctx := range ro.readIndexQueue {
+		i++
+		rs, ok := ro.pendingReadIndex[okctx]
+		if !ok {
+			panic("cannot find corresponding read state from pending map")
+		}
+		rss = append(rss, rs)
+		if okctx == ctx {
+			found = true
+			break
+		}
+	}
+
+	if found {
+		ro.readIndexQueue = ro.readIndexQueue[i:]
+		for _, rs := range rss {
+			delete(ro.pendingReadIndex, string(rs.req.Entries[0].Data))
+		}
+		return rss
+	}
+
+	return nil
+}
+```
+
+返回最后一条readonly请求的key
+
+```go
+// lastPendingRequestCtx returns the context of the last pending read only
+// request in readonly struct.
+func (ro *readOnly) lastPendingRequestCtx() string {
+	if len(ro.readIndexQueue) == 0 {
+		return ""
+	}
+	return ro.readIndexQueue[len(ro.readIndexQueue)-1]
+}
+```
+
+### readState
+
+TODO 感觉是readonly的context
+
+```go
+// ReadState provides state for read only query.
+// It's caller's responsibility to call ReadIndex first before getting
+// this state from ready, it's also caller's duty to differentiate if this
+// state is what it requests through RequestCtx, eg. given a unique id as
+// RequestCtx
+type ReadState struct {
+	Index      uint64
+	RequestCtx []byte
+}
+```
