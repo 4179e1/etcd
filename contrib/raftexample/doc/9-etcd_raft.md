@@ -188,7 +188,7 @@ type raft struct {
 	// isLearner is true if the local raft node is a learner.
 	isLearner bool
 
-	votes map[uint64]bool  // TODO
+	votes map[uint64]bool  // preVote 阶段用来收集voter，我要是去竞选leader，你会给我投票吗？
 
 	msgs []pb.Message   // TODO
 
@@ -482,6 +482,8 @@ func (r *raft) removeNode(id uint64) {
 
 ## 随机超时器
 
+入口是`resetRandomizedElectionTimeout()`，状态转换reset的时候设置
+
 ```go
 // pastElectionTimeout returns true iff r.electionElapsed is greater
 // than or equal to the randomized election timeout in
@@ -565,6 +567,12 @@ func (r *raft) becomeFollower(term uint64, lead uint64) {
 	r.logger.Infof("%x became follower at term %d", r.id, r.Term)
 }
 
+`becomeCandidate()`的几个特点：
+
+- 不能从Leader转换过来
+- Term 需要 + 1，这是唯一会增加term的地方
+- 给自己投一票 `r.Vote = r.id`
+
 func (r *raft) becomeCandidate() {
 	// TODO(xiangli) remove the panic when the raft implementation is stable
 	if r.state == StateLeader {
@@ -577,6 +585,11 @@ func (r *raft) becomeCandidate() {
 	r.state = StateCandidate
 	r.logger.Infof("%x became candidate at term %d", r.id, r.Term)
 }
+
+`becomePreCandidate()`只有启用PreVote的时候才会调用，跟`becomeCandiate()`类似，但是：
+- 不增加term
+- 不给自己投票
+- 需要征求voter的意见(r.votes)
 
 func (r *raft) becomePreCandidate() {
 	// TODO(xiangli) remove the panic when the raft implementation is stable
@@ -592,6 +605,14 @@ func (r *raft) becomePreCandidate() {
 	r.state = StatePreCandidate
 	r.logger.Infof("%x became pre-candidate at term %d", r.id, r.Term)
 }
+
+`becomeLeader()`:
+
+- 不能从Follower切过来
+- `r.prs[r.id].becomeReplicate()`让自己的Progress进入replicate状态，我自己就是leader耶
+- `r.pendingConfIndex = r.raftLog.lastIndex()`保守起见先不允许配置变更
+- `r.appendEntry(emptyEnt)`提交一个no op的entry，来保证之前的log都可以commit （raft thesis 3.6.2)
+- 上一步`appendEntry()`的时候会调用`increaseUncommittedSize()`把这个no op entry的大小算进去，这里是个special case不希望算进去，因此继续调用`reduceUncommittedSize()`减去这个大小
 
 func (r *raft) becomeLeader() {
 	// TODO(xiangli) remove the panic when the raft implementation is stable
@@ -628,4 +649,86 @@ func (r *raft) becomeLeader() {
 	r.reduceUncommittedSize([]pb.Entry{emptyEnt})
 	r.logger.Infof("%x became leader at term %d", r.id, r.Term)
 }
+```
+
+检查自己是不是能够变成leader，learner是不行的
+
+```go
+// promotable indicates whether state machine can be promoted to leader,
+// which is true when its own id is in progress list.
+func (r *raft) promotable() bool {
+	_, ok := r.prs[r.id]
+	return ok
+}
+```
+
+
+## UncommittedSize
+
+新建raft的时候Config中有一项是用来限制leader中未commit log总大小的:
+
+> 	// MaxUncommittedEntriesSize limits the aggregate byte size of the
+> 	// uncommitted entries that may be appended to a leader's log. Once this
+> 	// limit is exceeded, proposals will begin to return ErrProposalDropped
+> 	// errors. Note: 0 for no limit.
+> 	MaxUncommittedEntriesSize uint6
+
+
+`increaseUncommittedSize()`检测和增加uncommit entry占用的quota，如果加上新的ents要超过限制就不允许增加了，返回false
+
+```go
+// increaseUncommittedSize computes the size of the proposed entries and
+// determines whether they would push leader over its maxUncommittedSize limit.
+// If the new entries would exceed the limit, the method returns false. If not,
+// the increase in uncommitted entry size is recorded and the method returns
+// true.
+func (r *raft) increaseUncommittedSize(ents []pb.Entry) bool {
+	var s uint64
+	for _, e := range ents {
+		s += uint64(PayloadSize(e))
+	}
+
+	if r.uncommittedSize > 0 && r.uncommittedSize+s > r.maxUncommittedSize {
+		// If the uncommitted tail of the Raft log is empty, allow any size
+		// proposal. Otherwise, limit the size of the uncommitted tail of the
+		// log and drop any proposal that would push the size over the limit.
+		return false
+	}
+	r.uncommittedSize += s
+	return true
+}
+
+// PayloadSize is the size of the payload of this Entry. Notably, it does not
+// depend on its Index or Term.
+func PayloadSize(e pb.Entry) int {
+	return len(e.Data)
+}
+
+```
+
+当ents被commit之后，他们占用的ota就可以被释放了
+
+```go
+// reduceUncommittedSize accounts for the newly committed entries by decreasing
+// the uncommitted entry size limit.
+func (r *raft) reduceUncommittedSize(ents []pb.Entry) {
+	if r.uncommittedSize == 0 {
+		// Fast-path for followers, who do not track or enforce the limit.
+		return
+	}
+
+	var s uint64
+	for _, e := range ents {
+		s += uint64(PayloadSize(e))
+	}
+	if s > r.uncommittedSize {
+		// uncommittedSize may underestimate the size of the uncommitted Raft
+		// log tail but will never overestimate it. Saturate at 0 instead of
+		// allowing overflow.
+		r.uncommittedSize = 0
+	} else {
+		r.uncommittedSize -= s
+	}
+}
+
 ```

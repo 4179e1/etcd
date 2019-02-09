@@ -342,7 +342,7 @@ func RestartNode(c *Config) Node {
     - `prevHardSt = rd.HardState`
     - `prevSnapi = rd.Snapshot.Metadata.Index`
     - `index := rd.appliedCursor()`表示应用层（如果）applied这批更新的话，它的index会是什么。
-  - 置空raft结构中的msgs和readStates，并调用`r.reduceUncommittedSize(rd.CommittedEntries)`// 这个函数是干啥的？ raft数据结构的`uncommittedSize`字段的注释说：
+  - 置空raft结构中的msgs和readStates，并调用`r.reduceUncommittedSize(rd.CommittedEntries)`释放`UncommittedSize`的quota。是不是可以这么理解，从readyc读出来entry之后，说明这些entry已经被commit了？
 
   ```go
   	// an estimate of the size of the uncommitted tail of the Raft log. Used to
