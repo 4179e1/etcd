@@ -28,7 +28,7 @@ type unstable struct {
 }
 ```
 
-### maybe 系列函数 - 猜测可能的index和term
+### 获取index和term
 
 - `maybeFirstIndex()`返回可能是entry中第一个entry的index
   - 如果它有快照的话，就是返回快照index + 1
@@ -481,7 +481,7 @@ func (l *raftLog) mustCheckOutOfBounds(lo, hi uint64) error {
 
 关于entry还有另外两个函数
 
-`entries()`尝试返回storage和unstable所有的entries，前提是满足maxsize
+`entries()`尝试返回storage和unstable中index i 之后的所有entries，前提是满足maxsize
 `allEntreis()`调用`entries()`返回所有entries
 - maxize被设置为`noLimit`，即math.MaxUint64
 - 为了解决log compact可能导致的race condition，居然递归调用自己…… // TODO 这个race condition从哪来的？为什么前面俩个那个函数不用处理这个？
@@ -655,6 +655,25 @@ func (l *raftLog) maybeCommit(maxIndex, term uint64) bool {
 }
 ```
 
+### snapshot 和 restore
+
+类似的，如果unstable没有snapshot，就从storage里面去找
+
+```go
+func (l *raftLog) snapshot() (pb.Snapshot, error) {
+	if l.unstable.snapshot != nil {
+		return *l.unstable.snapshot, nil
+	}
+	return l.storage.Snapshot()
+}
+
+func (l *raftLog) restore(s pb.Snapshot) {
+	l.logger.Infof("log [%s] starts to restore snapshot [index: %d, term: %d]", l, s.Metadata.Index, s.Metadata.Term)
+	l.committed = s.Metadata.Index
+	l.unstable.restore(s)
+}
+```
+
 ## Progress
 
 Progress表示每一个peer或者learner当前的进度(从leader的角度),设计请参考[design.md](https://github.com/etcd-io/etcd/blob/master/raft/design.md)
@@ -736,7 +755,15 @@ inflights 在Progress的注释中有很详细的说明，它是一个滑动窗�
 - 个数限制：配置中的`MaxInflightMsgs`,最多同时发多少消息
 - 大小限制：配置中的`MaxSizePerMsg`，一条消息最大能有多大
 
-结构体中的`size`就是消息个数的限制，`raft.go`中创建`Progress`时`newInflights()`创建新的对象，size参数传入`r.maxInflight`
+所以窗口中的消息最多是 `MaxInflightMsgs` * `MaxSizePerMsg`
+
+inflights本质是一个数组实现的Queue (FIFO)，它的复杂的地方在于`buffer`是动态分配的，按照指数形式增长，但是最终不会超过`in.size` (n年前我好像也写过类似的玩意，处理起来头大）
+
+- size: 就是消息个数的限制，`raft.go`中创建`Progress`时`newInflights()`创建新的对象，size参数传入`r.maxInflight`
+- start: 队列头，初始化为0
+- count: 当前queue里面放了几个元素（有几个inflight的消息），根据start 和 count可以算出 队列尾的位置(next)
+- buffer: 动态分配的queue，每个元素存的是发送的一批entries里面最后一条的index
+
 
 ```go
 type inflights struct {
@@ -779,11 +806,9 @@ func (in *inflights) reset() {
 
 #### 添加
 
-TODO 为啥满了之后添加是直接panic呢？
+TODO 为啥满了之后添加是直接panic呢？除非caller有相应的防御机制，看到有一些，但是似乎不是所有rpc都做了这个检查
 
-添加复杂的地方在于inflights的`buffer`是动态分配的，按照指数形式增长，但是最终不会超过`in.size`
-buffer实质上是一个数组实现的FIFO的queue，next对象是用来计算元素应该存在哪
-
+添加复杂的地方在于
 ```go
 // add adds an inflight into inflights
 func (in *inflights) add(inflight uint64) {
@@ -858,7 +883,7 @@ func (in *inflights) freeFirstOne() { in.freeTo(in.buffer[in.start]) }
 
 ### 状态转换
 
-design.md 中有一段，没看懂
+design.md 中有一段，没看懂太懂
 
 > A progress changes to replicate when the follower replies with a non-rejection msgAppResp, which implies that it has matched the index sent. At this point, leader starts to stream log entries to the follower fast. The progress will fall back to probe when the follower replies a rejection msgAppResp or the link layer reports the follower is unreachable. We aggressively reset next to match+1 since if we receive any msgAppResp soon, both match and next will increase directly to the index in msgAppResp. (We might end up with sending some duplicate entries when aggressively reset next too low. see open question)
 
@@ -895,7 +920,8 @@ func (pr *Progress) becomeSnapshot(snapshoti uint64) {
 }
 ```
 
-还有几个replicate status的函数
+
+### replicate state
 
 ```go
 func (pr *Progress) pause()  { pr.Paused = true }
@@ -922,6 +948,7 @@ func (pr *Progress) IsPaused() bool {
 ### 更新Match和Next
 
 `maybeUpdated()`在AE rpc成功之后更新Match和Next
+`optimisticUpdzte()`啥都不检查，直接更新Next
 
 > 0 <= match < next <= lastindex
 
@@ -1149,7 +1176,7 @@ func (ro *readOnly) advance(m pb.Message) []*readIndexStatus {
 }
 ```
 
-返回最后一条readonly请求的key
+返回最后一条readonly请求的key，如果没有readonly Request，len == 0
 
 ```go
 // lastPendingRequestCtx returns the context of the last pending read only

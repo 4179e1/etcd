@@ -536,6 +536,219 @@ func (r *raft) hardState() pb.HardState {
 }
 ```
 
+## 发送消息
+
+### 发送Append
+
+`sendAppend()`其实是对`maybeSendAppend()`的封装，这个函数的参数是`to`，发给谁;`sendIfEmpty`是否发空的消息
+- 如果peer已经pause，则暂停发送
+- `term, errt := r.raftLog.term(pr.Next - 1)`获取上一条Log的term，用于log match
+- `ents, erre := r.raftLog.entries(pr.Next, r.maxMsgSize)`获取最大为`r.maxMsgSize`的entries
+- 如果取不到term 或者 ents，说明peer的状态是空的，它大概一条entry都没有，组装一个snapshot 算了(`m.Type = pb.MsgSnap`) // TODO
+  - 如果` r.raftLog.snapshot()`报错说`ErrSnapshotTemporarilyUnavailable`，就返回好了，晚点再试；如果是其他错误，我也不知道是啥，好慌 ，还是panic吧
+  - 调用`pr.becomeSnapshot(sindex)`把peer状态变为snapshot, （`IsPaused()`会返回True）
+- 如果peer有状态，那就发正常的AppenEntries RPC (`m.Type = pb.MsgApp`)
+  - `m.Index = pr.Next - 1` 和 `m.LogTerm = term`用于Log Match
+  - `m.Commit = r.raftLog.committed`告诉follower commit index
+  - 接着根据peer的状态采不同的行为
+    - 如果是正常的`ProgressStateReplicate`，
+	  - `last := m.Entries[n-1].Index`先获取最后一条entry的index
+	  - `pr.optimisticUpdate(last)`把peer的Next index更新为要发送的最后一条
+	  - `pr.ins.add(last)`把这个index加到progress的inflight （滑动窗口）中
+	- 如果是`ProgressStateProbe`，发完这一条就得先暂停一下了，//TODO，谁再把probe打开？
+- 最后调用`m.send`把组装好的消息发出去
+
+```go
+// sendAppend sends an append RPC with new entries (if any) and the
+// current commit index to the given peer.
+func (r *raft) sendAppend(to uint64) {
+	r.maybeSendAppend(to, true)
+}
+
+// maybeSendAppend sends an append RPC with new entries to the given peer,
+// if necessary. Returns true if a message was sent. The sendIfEmpty
+// argument controls whether messages with no entries will be sent
+// ("empty" messages are useful to convey updated Commit indexes, but
+// are undesirable when we're sending multiple messages in a batch).
+func (r *raft) maybeSendAppend(to uint64, sendIfEmpty bool) bool {
+	pr := r.getProgress(to)
+	if pr.IsPaused() {
+		return false
+	}
+	m := pb.Message{}
+	m.To = to
+
+	term, errt := r.raftLog.term(pr.Next - 1)
+	ents, erre := r.raftLog.entries(pr.Next, r.maxMsgSize)
+	if len(ents) == 0 && !sendIfEmpty {
+		return false
+	}
+
+	if errt != nil || erre != nil { // send snapshot if we failed to get term or entries
+		if !pr.RecentActive {
+			r.logger.Debugf("ignore sending snapshot to %x since it is not recently active", to)
+			return false
+		}
+
+		m.Type = pb.MsgSnap
+		snapshot, err := r.raftLog.snapshot()
+		if err != nil {
+			if err == ErrSnapshotTemporarilyUnavailable {
+				r.logger.Debugf("%x failed to send snapshot to %x because snapshot is temporarily unavailable", r.id, to)
+				return false
+			}
+			panic(err) // TODO(bdarnell)
+		}
+		if IsEmptySnap(snapshot) {
+			panic("need non-empty snapshot")
+		}
+		m.Snapshot = snapshot
+		sindex, sterm := snapshot.Metadata.Index, snapshot.Metadata.Term
+		r.logger.Debugf("%x [firstindex: %d, commit: %d] sent snapshot[index: %d, term: %d] to %x [%s]",
+			r.id, r.raftLog.firstIndex(), r.raftLog.committed, sindex, sterm, to, pr)
+		pr.becomeSnapshot(sindex)
+		r.logger.Debugf("%x paused sending replication messages to %x [%s]", r.id, to, pr)
+	} else {
+		m.Type = pb.MsgApp
+		m.Index = pr.Next - 1
+		m.LogTerm = term
+		m.Entries = ents
+		m.Commit = r.raftLog.committed
+		if n := len(m.Entries); n != 0 {
+			switch pr.State {
+			// optimistically increase the next when in ProgressStateReplicate
+			case ProgressStateReplicate:
+				last := m.Entries[n-1].Index
+				pr.optimisticUpdate(last)
+				pr.ins.add(last)
+			case ProgressStateProbe:
+				pr.pause()
+			default:
+				r.logger.Panicf("%x is sending append in unhandled state %s", r.id, pr.State)
+			}
+		}
+	}
+	r.send(m)
+	return true
+}
+```
+
+### send - 实际发送
+
+`send()`需要检查Term的合法性，
+- Leader election相关的消息需要，//TODO Resp中Term的含义，如果我接受选举，Leader的Term至少应该是
+- 其他类型的消息不需要 //TODO
+  - 但是pb.MsgProp 和 pb.MsgReadIndex 会自动把自己的`r.Term`带上，注释没看太明白，不过这两种消息是需要forward给leader的
+
+最后把这些消息添加到r.msgs中，node.Ready()会取走这些msgs，应用层需要自己把这些消息发出去
+
+```go
+// send persists state to stable storage and then sends to its mailbox.
+func (r *raft) send(m pb.Message) {
+	m.From = r.id
+	if m.Type == pb.MsgVote || m.Type == pb.MsgVoteResp || m.Type == pb.MsgPreVote || m.Type == pb.MsgPreVoteResp {
+		if m.Term == 0 {
+			// All {pre-,}campaign messages need to have the term set when
+			// sending.
+			// - MsgVote: m.Term is the term the node is campaigning for,
+			//   non-zero as we increment the term when campaigning.
+			// - MsgVoteResp: m.Term is the new r.Term if the MsgVote was
+			//   granted, non-zero for the same reason MsgVote is
+			// - MsgPreVote: m.Term is the term the node will campaign,
+			//   non-zero as we use m.Term to indicate the next term we'll be
+			//   campaigning for
+			// - MsgPreVoteResp: m.Term is the term received in the original
+			//   MsgPreVote if the pre-vote was granted, non-zero for the
+			//   same reasons MsgPreVote is
+			panic(fmt.Sprintf("term should be set when sending %s", m.Type))
+		}
+	} else {
+		if m.Term != 0 {
+			panic(fmt.Sprintf("term should not be set when sending %s (was %d)", m.Type, m.Term))
+		}
+		// do not attach term to MsgProp, MsgReadIndex
+		// proposals are a way to forward to the leader and
+		// should be treated as local message.
+		// MsgReadIndex is also forwarded to leader.
+		if m.Type != pb.MsgProp && m.Type != pb.MsgReadIndex {
+			m.Term = r.Term
+		}
+	}
+	r.msgs = append(r.msgs, m)
+}
+```
+
+### 发送心跳
+
+心跳同样是对`send()`的封装，最重要计算commit index `commit := min(r.getProgress(to).Match, r.raftLog.committed)`
+
+```go
+// sendHeartbeat sends a heartbeat RPC to the given peer.
+func (r *raft) sendHeartbeat(to uint64, ctx []byte) {
+	// Attach the commit as min(to.matched, r.committed).
+	// When the leader sends out heartbeat message,
+	// the receiver(follower) might not be matched with the leader
+	// or it might not have all the committed entries.
+	// The leader MUST NOT forward the follower's commit to
+	// an unmatched index.
+	commit := min(r.getProgress(to).Match, r.raftLog.committed)
+	m := pb.Message{
+		To:      to,
+		Type:    pb.MsgHeartbeat,
+		Commit:  commit,
+		Context: ctx,
+	}
+
+	r.send(m)
+}
+```
+
+## 广播
+
+### bcastAppend
+
+`brcastAppend()` 最终是对`maybeSendAppend()`的封装，给所有follower发一次
+
+```go
+// bcastAppend sends RPC, with entries to all peers that are not up-to-date
+// according to the progress recorded in r.prs.
+func (r *raft) bcastAppend() {
+	r.forEachProgress(func(id uint64, _ *Progress) {
+		if id == r.id {
+			return
+		}
+
+		r.sendAppend(id)
+	})
+}
+
+```
+### bcastHeartBeat
+
+`bcastHeartBeat()`最终是对`sendHeartbeat()`的封装，给所有follower发一次
+如果raft有正在等待的readonly request，把最后一个request context 带上 // TODO
+
+```go
+// bcastHeartbeat sends RPC, without entries to all the peers.
+func (r *raft) bcastHeartbeat() {
+	lastCtx := r.readOnly.lastPendingRequestCtx()
+	if len(lastCtx) == 0 {
+		r.bcastHeartbeatWithCtx(nil)
+	} else {
+		r.bcastHeartbeatWithCtx([]byte(lastCtx))
+	}
+}
+
+func (r *raft) bcastHeartbeatWithCtx(ctx []byte) {
+	r.forEachProgress(func(id uint64, _ *Progress) {
+		if id == r.id {
+			return
+		}
+		r.sendHeartbeat(id, ctx)
+	})
+}
+```
+
 ## 随机超时器
 
 `resetRandomizedElectionTimeout()`，状态转换reset的时候设置r.randomizedElectionTimeout

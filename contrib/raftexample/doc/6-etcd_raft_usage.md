@@ -60,8 +60,12 @@ type Ready struct {
 }
 ```
 
-Output的三元组对应：
+Output的三元组对应如下
+
+### Message
+
 1. Messages: Messages []pb.Message
+
 
 ```go
 type Message struct {
@@ -81,6 +85,45 @@ type Message struct {
 }
 ```
 
+- Type 包括：
+```go
+const (
+	MsgHup            MessageType = 0
+	MsgBeat           MessageType = 1
+	MsgProp           MessageType = 2
+	MsgApp            MessageType = 3			// App stands for `AppendEntries`...
+	MsgAppResp        MessageType = 4
+	MsgVote           MessageType = 5
+	MsgVoteResp       MessageType = 6
+	MsgSnap           MessageType = 7
+	MsgHeartbeat      MessageType = 8
+	MsgHeartbeatResp  MessageType = 9
+	MsgUnreachable    MessageType = 10
+	MsgSnapStatus     MessageType = 11
+	MsgCheckQuorum    MessageType = 12
+	MsgTransferLeader MessageType = 13
+	MsgTimeoutNow     MessageType = 14
+	MsgReadIndex      MessageType = 15
+	MsgReadIndexResp  MessageType = 16
+	MsgPreVote        MessageType = 17
+	MsgPreVoteResp    MessageType = 18
+)
+```
+
+- To: 接受方
+- From: 发送方
+- Term: 用于leader election，表示node当前的Term。pb.MsgVote pb.MsgVoteResp pb.MsgPreVote pb.MsgPreVoteResp 这几条消息必须设置Term，见[9-etcd_raft](./9-etcd_raft.md)
+- LogTerm: 这些`Entries`的**上一条**entry对应的Term，用于log match
+- Index: 这些`Entries`的**上一条**entry对应的index，用于log match
+- Entries: 要append的Entry
+- Commit: leader的commit index
+- Snapshot: snapshot的内容，如果是MsgSnap
+- Reject: follower是否reject
+- RejectHint: follower 第一条冲突的log index
+- Context: 消息上下文，用来识别同一条消息？
+
+### Entry
+
 2. log entries: Entries []pb.Entry
 
 ```go
@@ -92,6 +135,20 @@ type Entry struct {
 	XXX_unrecognized []byte    `json:"-"`
 }
 ```
+- Term: 这条Entry的term
+- Index： 这条Entry的Index
+- Type： 只有两种
+```go
+type EntryType int32
+
+const (
+	EntryNormal     EntryType = 0
+	EntryConfChange EntryType = 1
+)
+```
+- Data: 对应的内容
+
+### HardState & SoftState
 
 3. Raft state chanes: pb.HardState。*SoftState算吗？
 
@@ -114,6 +171,10 @@ type HardState struct {
 	XXX_unrecognized []byte `json:"-"`
 }
 ```
+
+- Term: 当前的Term
+- Vote： 当前Term给谁投了票
+- Commit: 已经确认commit的index，用来apply到状态机中
 
 `SoftState`是易失的状态，包含lead信息和当前节点状态，不需要持久化
 
