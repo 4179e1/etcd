@@ -144,16 +144,16 @@ type Config struct {
 
 Raft数据结构中封装了非常多的成员，其中一部分来自配置信息;一部分比较复杂的成员单独放到下一节详细描述;另一些我在行内直接注释。
 
-- matchedbuf
-是这个吗？
-> raft thesis 10.2.1 提出一种优化，在发送AppendEntry的同时进行持久化：To handle this simply, the leader uses its own match index to indicate the latest entry to have been durably written to its disk. Once an entry in the leader’s current term is covered by a majority of match indexes, the leader can advance its commit index. 
-
 - pendingConfIndex
 etcd raft对成员变更的变种实现
 > To ensure there is no attempt to commit two membership changes at once by matching log positions (which would be unsafe since they should have different quorum requirements), any proposed membership change is simply disallowed while any uncommitted change appears in the leader's log.
 
 - tick/step
 这是两个没有初始化的函数指针，他们是在状态转换，比如`becomeLeader()`的时候设置的，不同的角色需要执行的动作不同
+
+- electionElapsed/heartbeatElapsed
+这是两个计数器，从0开始递增，当它们的值大于等于	heartbeatTimeout/electionTimeout 时就会重置为0,并且触发特定的动作 -- Step 一条特定的消息.
+注意`electionElapsed`对leader/candidate 以及 follower 的含义稍有不同
 
 ```go
 // Possible values for StateType.
@@ -215,11 +215,11 @@ type raft struct {
 	// or candidate.
 	// number of ticks since it reached last electionTimeout or received a
 	// valid message from current leader when it is a follower.
-	electionElapsed int //TODO，对于leader/candidate 跟 follower的意义不太一样，没看懂
+	electionElapsed int
 
 	// number of ticks since it reached last heartbeatTimeout.
 	// only leader keeps heartbeatElapsed.
-	heartbeatElapsed int  // 同样没看懂
+	heartbeatElapsed int 
 
 	checkQuorum bool     // 由Config初始化
 	preVote     bool     // 由Config初始化
@@ -232,8 +232,8 @@ type raft struct {
 	randomizedElectionTimeout int  // 根据electiontimout算出一个随机的超时时间
 	disableProposalForwarding bool   // 由Config初始化
 
-	tick func()				//
-	step stepFunc			// 
+	tick func()
+	step stepFunc
 
 	logger Logger			// 由Config初始化
 }
@@ -459,6 +459,8 @@ TODO:下列函数的实现
 - 现在quorum变小了，看看是不是能commit了`r.maybeCommit()`，是的话`r.bcastAppend()`
 - 如果我是leader并且被删除的是leader transfer的目标，`r.abortLeaderTransfer()`
 
+`r.abortLeaderTransfer()`的实现特别简单
+
 ```go
 func (r *raft) removeNode(id uint64) {
 	r.delProgress(id)
@@ -478,11 +480,66 @@ func (r *raft) removeNode(id uint64) {
 		r.abortLeaderTransfer()
 	}
 }
+
+func (r *raft) abortLeaderTransfer() {
+	r.leadTransferee = None
+}
+```
+
+## 获取节点和状态信息
+
+获取voter和learner
+
+```go
+func (r *raft) nodes() []uint64 {
+	nodes := make([]uint64, 0, len(r.prs))
+	for id := range r.prs {
+		nodes = append(nodes, id)
+	}
+	sort.Sort(uint64Slice(nodes))
+	return nodes
+}
+
+func (r *raft) learnerNodes() []uint64 {
+	nodes := make([]uint64, 0, len(r.learnerPrs))
+	for id := range r.learnerPrs {
+		nodes = append(nodes, id)
+	}
+	sort.Sort(uint64Slice(nodes))
+	return nodes
+}
+
+```
+
+上面的unit64Slice是干嘛的？它实现了Sort接口
+
+```go
+// uint64Slice implements sort interface
+type uint64Slice []uint64
+
+func (p uint64Slice) Len() int           { return len(p) }
+func (p uint64Slice) Less(i, j int) bool { return p[i] < p[j] }
+func (p uint64Slice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] 
+```
+
+softstate 和 hardstate
+
+```go
+func (r *raft) softState() *SoftState { return &SoftState{Lead: r.lead, RaftState: r.state} }
+
+func (r *raft) hardState() pb.HardState {
+	return pb.HardState{
+		Term:   r.Term,
+		Vote:   r.Vote,
+		Commit: r.raftLog.committed,
+	}
+}
 ```
 
 ## 随机超时器
 
-入口是`resetRandomizedElectionTimeout()`，状态转换reset的时候设置
+`resetRandomizedElectionTimeout()`，状态转换reset的时候设置r.randomizedElectionTimeout
+`pastElectionTimeout()检查election timeout是否到了
 
 ```go
 // pastElectionTimeout returns true iff r.electionElapsed is greater
@@ -518,6 +575,8 @@ var globalRand = &lockedRand{
 
 ## 状态转换
 
+### reset
+
 `reset()`需要一个term参数，重置现在的状态
 - 如果term发生了变化，重置Vote，否则保留
 - 重置各种计数器
@@ -552,6 +611,8 @@ func (r *raft) reset(term uint64) {
 }
 ```
 
+### follower
+
 `becomeFollower()`比较简单，`reset()`并且设置
 - `step`,`tick`两个函数指针
 - `state` 为`StateFollower`
@@ -566,6 +627,8 @@ func (r *raft) becomeFollower(term uint64, lead uint64) {
 	r.state = StateFollower
 	r.logger.Infof("%x became follower at term %d", r.id, r.Term)
 }
+
+### candidate
 
 `becomeCandidate()`的几个特点：
 
@@ -585,6 +648,8 @@ func (r *raft) becomeCandidate() {
 	r.state = StateCandidate
 	r.logger.Infof("%x became candidate at term %d", r.id, r.Term)
 }
+
+### precandidate
 
 `becomePreCandidate()`只有启用PreVote的时候才会调用，跟`becomeCandiate()`类似，但是：
 - 不增加term
@@ -606,9 +671,12 @@ func (r *raft) becomePreCandidate() {
 	r.logger.Infof("%x became pre-candidate at term %d", r.id, r.Term)
 }
 
+### leader
+
 `becomeLeader()`:
 
 - 不能从Follower切过来
+- `r.lead = r.id`把自己设置为leader
 - `r.prs[r.id].becomeReplicate()`让自己的Progress进入replicate状态，我自己就是leader耶
 - `r.pendingConfIndex = r.raftLog.lastIndex()`保守起见先不允许配置变更
 - `r.appendEntry(emptyEnt)`提交一个no op的entry，来保证之前的log都可以commit （raft thesis 3.6.2)
@@ -662,8 +730,150 @@ func (r *raft) promotable() bool {
 }
 ```
 
+检查cluster是不是有leader
 
-## UncommittedSize
+```go
+func (r *raft) hasLeader() bool { return r.lead != None }
+```
+
+## tick
+
+node的主循环中，每当ticker超时的时候，都会调用一次`r.tick()`，这是一个函数指针，根据角色的不同指向两个不同的对象：
+
+follower : tickElection
+candidate: tickElection
+preCandidate: tickElection
+leader: tickHeartBeat
+
+
+### tickElection
+
+用于非leader角色
+每次调用`tickElection()`累加r.electionElapsed
+当自己可以被提升了leader，并且election timeout超时的时候，发一条`pb.MsgHup`, //TODO 这是选举还是啥？
+
+肯定还有个别的地方会重置r.electionElapsed，估计在Step里面
+
+```go
+// tickElection is run by followers and candidates after r.electionTimeout.
+func (r *raft) tickElection() {
+	r.electionElapsed++
+
+	if r.promotable() && r.pastElectionTimeout() {
+		r.electionElapsed = 0
+		r.Step(pb.Message{From: r.id, Type: pb.MsgHup})
+	}
+}
+```
+
+### tickHeartBeat
+
+leader专属，除了累加electionElapsed以外，还会累加heartbeatElapsed
+
+- 当election  timeout时
+  - 重置r.electionElapsed
+  - 如果启用了checkQuorum， step一条`pb.MsgCheckQuorum`的消息，检查自己是否还是合法的leader //TODO，这个什么时候会返回？
+  - 如果一个election timeout之内还没法完成leader transfer,直接取消
+- 如果自己不再是leader了，直接返回吧
+- 最后是heartbeat的处理，每当heartbeat timeout，step 一条`pb.MsgBeat`
+
+```go
+// tickHeartbeat is run by leaders to send a MsgBeat after r.heartbeatTimeout.
+func (r *raft) tickHeartbeat() {
+	r.heartbeatElapsed++
+	r.electionElapsed++
+
+	if r.electionElapsed >= r.electionTimeout {
+		r.electionElapsed = 0
+		if r.checkQuorum {
+			r.Step(pb.Message{From: r.id, Type: pb.MsgCheckQuorum})
+		}
+		// If current leader cannot transfer leadership in electionTimeout, it becomes leader again.
+		if r.state == StateLeader && r.leadTransferee != None {
+			r.abortLeaderTransfer()
+		}
+	}
+
+	if r.state != StateLeader {
+		return
+	}
+
+	if r.heartbeatElapsed >= r.heartbeatTimeout {
+		r.heartbeatElapsed = 0
+		r.Step(pb.Message{From: r.id, Type: pb.MsgBeat})
+	}
+}
+```
+
+## Append Entry 和 Commit
+
+`appendEntry()`尝试增加一些entry
+- 首先给es带上当前的term，标上index
+- 然后调用`increaseUncommittedSize`增加quota - 见后文
+- 使用`li = r.raftLog.append(es...)`直接追加到raftLog中，这里不需要`maybeAppend()`，因为编号都是按照现有的来，不存在冲突
+- `r.getProgress(r.id).maybeUpdate(li)`把自己的Progress更新到最后一条
+- 最后调用`r.maybeCommit()`尝试commit
+
+```go
+func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
+	li := r.raftLog.lastIndex()
+	for i := range es {
+		es[i].Term = r.Term
+		es[i].Index = li + 1 + uint64(i)
+	}
+	// Track the size of this uncommitted proposal.
+	if !r.increaseUncommittedSize(es) {
+		r.logger.Debugf(
+			"%x appending new entries to log would exceed uncommitted entry size limit; dropping proposal",
+			r.id,
+		)
+		// Drop the proposal.
+		return false
+	}
+	// use latest "last" index after truncate/append
+	li = r.raftLog.append(es...)
+	r.getProgress(r.id).maybeUpdate(li)
+	// Regardless of maybeCommit's return, our caller will call bcastAppend.
+	r.maybeCommit()
+	return true
+}
+```
+
+先看行内注释吧
+
+tricky的地方在于`mci := mis[len(mis)-r.quorum()]`，mis是所有voter的match index，从小到大排列。
+
+假设一个5节点的cluster， len(mis) = 5, r.quorum = 3，所以mci := mis [5 - 3] = mis[2]
+mis的下标为 0, 1, 2, 3, 4, 也就是中间元素的下标，注意它们是从小到大排列的。
+这也就意味着，多数派的match index已经大于等于mis[2] (mis[2,3,4])，那么mis[2]对应的log index已经复制到多数派了，这个index可以commit了
+
+> raft thesis 10.2.1 提出一种优化，在发送AppendEntry的同时进行持久化：To handle this simply, the leader uses its own match index to indicate the latest entry to have been durably written to its disk. Once an entry in the leader’s current term is covered by a majority of match indexes, the leader can advance its commit index. 
+
+```go
+// maybeCommit attempts to advance the commit index. Returns true if
+// the commit index changed (in which case the caller should call
+// r.bcastAppend).
+func (r *raft) maybeCommit() bool {
+	// Preserving matchBuf across calls is an optimization
+	// used to avoid allocating a new slice on each call.
+	if cap(r.matchBuf) < len(r.prs) {
+		r.matchBuf = make(uint64Slice, len(r.prs))  // 这一段貌似在分配空间（raft一开始没初始化），或者集群成员大小变化的时候重新分配
+	}
+	mis := r.matchBuf[:len(r.prs)]  // 按照prs的长度截断
+	idx := 0
+	for _, p := range r.prs {
+		mis[idx] = p.Match  //获取每一个voter的 Match 进度
+		idx++
+	}
+	sort.Sort(mis)   // 从小到大排列match index, matchBuf类型是上面提到过的uint64Slice
+	mci := mis[len(mis)-r.quorum()]  
+	return r.raftLog.maybeCommit(mci, r.Term)
+}
+
+func (r *raft) quorum() int { return len(r.prs)/2 + 1 }
+```
+
+## Uncommit Quota
 
 新建raft的时候Config中有一项是用来限制leader中未commit log总大小的:
 
@@ -706,7 +916,7 @@ func PayloadSize(e pb.Entry) int {
 
 ```
 
-当ents被commit之后，他们占用的ota就可以被释放了
+当ents被commit之后，他们占用的quota就可以被释放了
 
 ```go
 // reduceUncommittedSize accounts for the newly committed entries by decreasing
@@ -730,5 +940,158 @@ func (r *raft) reduceUncommittedSize(ents []pb.Entry) {
 		r.uncommittedSize -= s
 	}
 }
+```
 
+
+
+## Step
+
+`Step()`是raft处理消息的入口，当node处理这些channel的时候会调用Step
+- propc 收到客户端请求
+- recvc 收到voter/learner的
+
+```go
+func (r *raft) Step(m pb.Message) error {
+	// Handle the message term, which may result in our stepping down to a follower.
+	switch {
+	case m.Term == 0:
+		// local message
+	case m.Term > r.Term:
+		if m.Type == pb.MsgVote || m.Type == pb.MsgPreVote {
+			force := bytes.Equal(m.Context, []byte(campaignTransfer))
+			inLease := r.checkQuorum && r.lead != None && r.electionElapsed < r.electionTimeout
+			if !force && inLease {
+				// If a server receives a RequestVote request within the minimum election timeout
+				// of hearing from a current leader, it does not update its term or grant its vote
+				r.logger.Infof("%x [logterm: %d, index: %d, vote: %x] ignored %s from %x [logterm: %d, index: %d] at term %d: lease is not expired (remaining ticks: %d)",
+					r.id, r.raftLog.lastTerm(), r.raftLog.lastIndex(), r.Vote, m.Type, m.From, m.LogTerm, m.Index, r.Term, r.electionTimeout-r.electionElapsed)
+				return nil
+			}
+		}
+		switch {
+		case m.Type == pb.MsgPreVote:
+			// Never change our term in response to a PreVote
+		case m.Type == pb.MsgPreVoteResp && !m.Reject:
+			// We send pre-vote requests with a term in our future. If the
+			// pre-vote is granted, we will increment our term when we get a
+			// quorum. If it is not, the term comes from the node that
+			// rejected our vote so we should become a follower at the new
+			// term.
+		default:
+			r.logger.Infof("%x [term: %d] received a %s message with higher term from %x [term: %d]",
+				r.id, r.Term, m.Type, m.From, m.Term)
+			if m.Type == pb.MsgApp || m.Type == pb.MsgHeartbeat || m.Type == pb.MsgSnap {
+				r.becomeFollower(m.Term, m.From)
+			} else {
+				r.becomeFollower(m.Term, None)
+			}
+		}
+
+	case m.Term < r.Term:
+		if (r.checkQuorum || r.preVote) && (m.Type == pb.MsgHeartbeat || m.Type == pb.MsgApp) {
+			// We have received messages from a leader at a lower term. It is possible
+			// that these messages were simply delayed in the network, but this could
+			// also mean that this node has advanced its term number during a network
+			// partition, and it is now unable to either win an election or to rejoin
+			// the majority on the old term. If checkQuorum is false, this will be
+			// handled by incrementing term numbers in response to MsgVote with a
+			// higher term, but if checkQuorum is true we may not advance the term on
+			// MsgVote and must generate other messages to advance the term. The net
+			// result of these two features is to minimize the disruption caused by
+			// nodes that have been removed from the cluster's configuration: a
+			// removed node will send MsgVotes (or MsgPreVotes) which will be ignored,
+			// but it will not receive MsgApp or MsgHeartbeat, so it will not create
+			// disruptive term increases, by notifying leader of this node's activeness.
+			// The above comments also true for Pre-Vote
+			//
+			// When follower gets isolated, it soon starts an election ending
+			// up with a higher term than leader, although it won't receive enough
+			// votes to win the election. When it regains connectivity, this response
+			// with "pb.MsgAppResp" of higher term would force leader to step down.
+			// However, this disruption is inevitable to free this stuck node with
+			// fresh election. This can be prevented with Pre-Vote phase.
+			r.send(pb.Message{To: m.From, Type: pb.MsgAppResp})
+		} else if m.Type == pb.MsgPreVote {
+			// Before Pre-Vote enable, there may have candidate with higher term,
+			// but less log. After update to Pre-Vote, the cluster may deadlock if
+			// we drop messages with a lower term.
+			r.logger.Infof("%x [logterm: %d, index: %d, vote: %x] rejected %s from %x [logterm: %d, index: %d] at term %d",
+				r.id, r.raftLog.lastTerm(), r.raftLog.lastIndex(), r.Vote, m.Type, m.From, m.LogTerm, m.Index, r.Term)
+			r.send(pb.Message{To: m.From, Term: r.Term, Type: pb.MsgPreVoteResp, Reject: true})
+		} else {
+			// ignore other cases
+			r.logger.Infof("%x [term: %d] ignored a %s message with lower term from %x [term: %d]",
+				r.id, r.Term, m.Type, m.From, m.Term)
+		}
+		return nil
+	}
+
+	switch m.Type {
+	case pb.MsgHup:
+		if r.state != StateLeader {
+			ents, err := r.raftLog.slice(r.raftLog.applied+1, r.raftLog.committed+1, noLimit)
+			if err != nil {
+				r.logger.Panicf("unexpected error getting unapplied entries (%v)", err)
+			}
+			if n := numOfPendingConf(ents); n != 0 && r.raftLog.committed > r.raftLog.applied {
+				r.logger.Warningf("%x cannot campaign at term %d since there are still %d pending configuration changes to apply", r.id, r.Term, n)
+				return nil
+			}
+
+			r.logger.Infof("%x is starting a new election at term %d", r.id, r.Term)
+			if r.preVote {
+				r.campaign(campaignPreElection)
+			} else {
+				r.campaign(campaignElection)
+			}
+		} else {
+			r.logger.Debugf("%x ignoring MsgHup because already leader", r.id)
+		}
+
+	case pb.MsgVote, pb.MsgPreVote:
+		if r.isLearner {
+			// TODO: learner may need to vote, in case of node down when confchange.
+			r.logger.Infof("%x [logterm: %d, index: %d, vote: %x] ignored %s from %x [logterm: %d, index: %d] at term %d: learner can not vote",
+				r.id, r.raftLog.lastTerm(), r.raftLog.lastIndex(), r.Vote, m.Type, m.From, m.LogTerm, m.Index, r.Term)
+			return nil
+		}
+		// We can vote if this is a repeat of a vote we've already cast...
+		canVote := r.Vote == m.From ||
+			// ...we haven't voted and we don't think there's a leader yet in this term...
+			(r.Vote == None && r.lead == None) ||
+			// ...or this is a PreVote for a future term...
+			(m.Type == pb.MsgPreVote && m.Term > r.Term)
+		// ...and we believe the candidate is up to date.
+		if canVote && r.raftLog.isUpToDate(m.Index, m.LogTerm) {
+			r.logger.Infof("%x [logterm: %d, index: %d, vote: %x] cast %s for %x [logterm: %d, index: %d] at term %d",
+				r.id, r.raftLog.lastTerm(), r.raftLog.lastIndex(), r.Vote, m.Type, m.From, m.LogTerm, m.Index, r.Term)
+			// When responding to Msg{Pre,}Vote messages we include the term
+			// from the message, not the local term. To see why consider the
+			// case where a single node was previously partitioned away and
+			// it's local term is now of date. If we include the local term
+			// (recall that for pre-votes we don't update the local term), the
+			// (pre-)campaigning node on the other end will proceed to ignore
+			// the message (it ignores all out of date messages).
+			// The term in the original message and current local term are the
+			// same in the case of regular votes, but different for pre-votes.
+			r.send(pb.Message{To: m.From, Term: m.Term, Type: voteRespMsgType(m.Type)})
+			if m.Type == pb.MsgVote {
+				// Only record real votes.
+				r.electionElapsed = 0
+				r.Vote = m.From
+			}
+		} else {
+			r.logger.Infof("%x [logterm: %d, index: %d, vote: %x] rejected %s from %x [logterm: %d, index: %d] at term %d",
+				r.id, r.raftLog.lastTerm(), r.raftLog.lastIndex(), r.Vote, m.Type, m.From, m.LogTerm, m.Index, r.Term)
+			r.send(pb.Message{To: m.From, Term: r.Term, Type: voteRespMsgType(m.Type), Reject: true})
+		}
+
+	default:
+		err := r.step(r, m)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
 ```
