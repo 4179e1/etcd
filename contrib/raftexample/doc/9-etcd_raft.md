@@ -840,6 +840,7 @@ func (r *raft) becomeFollower(term uint64, lead uint64) {
 	r.state = StateFollower
 	r.logger.Infof("%x became follower at term %d", r.id, r.Term)
 }
+```
 
 ### candidate
 
@@ -849,6 +850,7 @@ func (r *raft) becomeFollower(term uint64, lead uint64) {
 - Term 需要 + 1，这是唯一会增加term的地方
 - 给自己投一票 `r.Vote = r.id`
 
+```go
 func (r *raft) becomeCandidate() {
 	// TODO(xiangli) remove the panic when the raft implementation is stable
 	if r.state == StateLeader {
@@ -861,6 +863,7 @@ func (r *raft) becomeCandidate() {
 	r.state = StateCandidate
 	r.logger.Infof("%x became candidate at term %d", r.id, r.Term)
 }
+```
 
 ### precandidate
 
@@ -869,6 +872,7 @@ func (r *raft) becomeCandidate() {
 - 不给自己投票
 - 需要征求voter的意见(r.votes)
 
+```go
 func (r *raft) becomePreCandidate() {
 	// TODO(xiangli) remove the panic when the raft implementation is stable
 	if r.state == StateLeader {
@@ -883,6 +887,7 @@ func (r *raft) becomePreCandidate() {
 	r.state = StatePreCandidate
 	r.logger.Infof("%x became pre-candidate at term %d", r.id, r.Term)
 }
+```
 
 ### leader
 
@@ -895,6 +900,7 @@ func (r *raft) becomePreCandidate() {
 - `r.appendEntry(emptyEnt)`提交一个no op的entry，来保证之前的log都可以commit （raft thesis 3.6.2)
 - 上一步`appendEntry()`的时候会调用`increaseUncommittedSize()`把这个no op entry的大小算进去，这里是个special case不希望算进去，因此继续调用`reduceUncommittedSize()`减去这个大小
 
+```go
 func (r *raft) becomeLeader() {
 	// TODO(xiangli) remove the panic when the raft implementation is stable
 	if r.state == StateFollower {
@@ -1155,13 +1161,54 @@ func (r *raft) reduceUncommittedSize(ents []pb.Entry) {
 }
 ```
 
-
-
 ## Step
 
-`Step()`是raft处理消息的入口，当node处理这些channel的时候会调用Step
+`Step()`是raft处理消息的入口，当node处理这些channel的时候会调用Step去处理这些接受的消息
 - propc 收到客户端请求
-- recvc 收到voter/learner的
+- recvc 收到voter/learner的消息
+
+raft有一个同样的消息处理函数`Step()`，每个角色还有自己特有的消息处理函数，即raft结构体中的stepfunc（在角色状态转换时设置）。如果通用的`Step()`处理不了某条消息，则发给角色特有的stepfunc去处理:
+
+- follower: stepFollower
+- candidate: stepCandidate
+- preCandidate: stepCandidate
+- leader: stepLeader
+
+来看`Step()`函数
+
+第一个switch检查 term
+- 如果term == 0 说明是给本机的消息，什么都不做
+- 如果消息的term 比 自己的term 大，正常的处理流程应该是增加自己的term，不过有几个例外：
+    - 如果消息类型是`pb.MsgVote`或者`pb.MsgPreVote`
+        - `force := bytes.Equal(m.Context, []byte(campaignTransfer))` 看看消息是不是要求 leader transfer
+        - `inLease := r.checkQuorum && r.lead != None && r.electionElapsed < r.electionTimeout` 当满足下面三个条件时inLease为真
+            - `r.checkQuorum` : 启用了leader quorum检查， TODO 有点奇怪，都启用quorum了还检查啥lease
+            - `r.lead != None` 现在有leader
+            - `r.electionElapsed < r.electionTimeout` election timout 没有超时
+        - `if !force && inLease`当不要求leader tranfser，并且在lease 范围内时，什么都不做，打印一条日志后返回。这是raft thesis 4.2.3 为了防止一个server从网络分区中恢复时推翻正常的leader。
+    - 如果消息类型是`pb.MsgPreVote`，不改变term ，这里force可以为true也也可以为false，但是inLease 一定是false的
+    - 如果消息类型是`pb.MsgPreVotResp`，并且它没有拒绝，同样什么都不干 // TODO 好像不太对耶，peer的term比我们大，还不拒绝…… 
+    - 其他情况下，需要切换为follower，不管之前是什么状态
+        - 如果消息是`pb.MsgApp`,`pb.MsgHeartbeat`,`pb.MsgSnap`这些只能从leader发来的消息，我们就认为发送方是leader，调用`r.becomeFollower(m.Term, m.From)`
+        - 其他情况下，我们也不知道现在的leader 是谁`r.becomeFollower(m.Term, None)`
+- 如果消息的term 比自己的term 要小，分下面几种情况（最后不管什么情况都会直接返回nil，不再继续处理）
+    - 如果同时满足这两种情况
+	    - `(r.checkQuorum || r.preVote)`启用了`checkQuorum`或者启用了`preVote`
+        - `(m.Type == pb.MsgHeartbeat || m.Type == pb.MsgApp)`这是heartbeat或者append rpc消息 
+        - 这些消息只能来自leader,两种可能 1) leader消息延迟 2) 本节点从网络分区中恢复，因此term 比 leader要高
+            - TODO 这一大段注释没看懂
+            - 最后发送一条`MsgAppResp`，并且接受这条消息（Reject 默认为 false），`MsgHeartBeat`也用`MsgAppRes`来回复？
+	- 否则，如果消息是`pb.MsgPreVote`，直接发一条`pb.MsgPreVoteResp`拒绝这个请求
+        - TODO 那段注释的意思是这样吗？ 如果不回复的话会导致死锁，因为这样precandidate不知道新的term是什么。
+        - 这样只是这个precandidate死锁吧？
+	- 其他所有情况直接忽略掉，不回复
+	- 之后返回nil不再继续处理
+
+
+raft thesis 4.2.3 
+> We modify the RequestVote RPC to achieve this: if a server receives a RequestVote
+request within the minimum election timeout of hearing from a current leader, it does not update its
+term or grant its vote.
 
 ```go
 func (r *raft) Step(m pb.Message) error {
@@ -1307,4 +1354,25 @@ func (r *raft) Step(m pb.Message) error {
 	}
 	return nil
 }
+```
+
+campaignType 包括
+```go
+
+// CampaignType represents the type of campaigning
+// the reason we use the type of string instead of uint64
+// is because it's simpler to compare and fill in raft entries
+type CampaignType string
+
+// Possible values for CampaignType
+const (
+	// campaignPreElection represents the first phase of a normal election when
+	// Config.PreVote is true.
+	campaignPreElection CampaignType = "CampaignPreElection"
+	// campaignElection represents a normal (time-based) election (the second phase
+	// of the election when Config.PreVote is true).
+	campaignElection CampaignType = "CampaignElection"
+	// campaignTransfer represents the type of leader transfer
+	campaignTransfer CampaignType = "CampaignTransfer"
+)
 ```
