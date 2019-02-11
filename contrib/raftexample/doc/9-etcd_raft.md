@@ -969,7 +969,7 @@ leader: tickHeartBeat
 
 用于非leader角色
 每次调用`tickElection()`累加r.electionElapsed
-当自己可以被提升了leader，并且election timeout超时的时候，发一条`pb.MsgHup`, //TODO 这是选举还是啥？
+当自己可以被提升了leader，并且election timeout超时的时候，发一条`pb.MsgHup`发起竞选
 
 肯定还有个别的地方会重置r.electionElapsed，估计在Step里面
 
@@ -1161,6 +1161,118 @@ func (r *raft) reduceUncommittedSize(ents []pb.Entry) {
 }
 ```
 
+## Campaign
+
+campaign 用于竞选leader
+
+campaignType 包括
+```go
+
+// CampaignType represents the type of campaigning
+// the reason we use the type of string instead of uint64
+// is because it's simpler to compare and fill in raft entries
+type CampaignType string
+
+// Possible values for CampaignType
+const (
+	// campaignPreElection represents the first phase of a normal election when
+	// Config.PreVote is true.
+	campaignPreElection CampaignType = "CampaignPreElection"
+	// campaignElection represents a normal (time-based) election (the second phase
+	// of the election when Config.PreVote is true).
+	campaignElection CampaignType = "CampaignElection"
+	// campaignTransfer represents the type of leader transfer
+	campaignTransfer CampaignType = "CampaignTransfer"
+)
+```
+
+`poll()`函数接收投票结果，并返回获得的票数 （这个函数需要多次调用，每个node一次,并且每个node投多次的花只算第一次）
+它的三个参数分别表示谁（`id`），发了什么类型的消息（`v`，preVote或者Vote），结果是什么（`v` 同意或者拒绝)
+
+```go
+func (r *raft) poll(id uint64, t pb.MessageType, v bool) (granted int) {
+	if v {
+		r.logger.Infof("%x received %s from %x at term %d", r.id, t, id, r.Term)
+	} else {
+		r.logger.Infof("%x received %s rejection from %x at term %d", r.id, t, id, r.Term)
+	}
+	if _, ok := r.votes[id]; !ok {
+		r.votes[id] = v
+	}
+	for _, vv := range r.votes {
+		if vv {
+			granted++
+		}
+	}
+	return granted
+}
+```
+
+(Pre)Candidate调用`campaign()`给自己拉票，
+根据是ProVote还是Vote组装不同的消息`voteMsg`， 注意对于`PreVote`，发送的term会设置为当前r.term + 1（因为它后面要是发Vote的话，会自增term）
+首先调用`poll()`给自己投一票，对于单节点cluster来说它就胜出了
+- 如果是`campaignElection`，继续调用`campaign(campaignElection)`成为Leader（就是下一个分支）
+- 否则`r.becomeLeader()`直接切换为Leader，为什么`campaignTransfer`也能切成leader？单节点cluster是不会有leader transfer的。。。
+
+最后给所有除自己以外的node发送刚才组装好的`voteMsg`，如果是`campaignTransfer`,会把msg 的 Context 设置为 “CampaignTransfer”
+
+```go
+func (r *raft) campaign(t CampaignType) {
+	var term uint64
+	var voteMsg pb.MessageType
+	if t == campaignPreElection {
+		r.becomePreCandidate()
+		voteMsg = pb.MsgPreVote
+		// PreVote RPCs are sent for the next term before we've incremented r.Term.
+		term = r.Term + 1
+	} else {
+		r.becomeCandidate()
+		voteMsg = pb.MsgVote
+		term = r.Term
+	}
+	if r.quorum() == r.poll(r.id, voteRespMsgType(voteMsg), true) {
+		// We won the election after voting for ourselves (which must mean that
+		// this is a single-node cluster). Advance to the next state.
+		if t == campaignPreElection {
+			r.campaign(campaignElection)
+		} else {
+			r.becomeLeader()
+		}
+		return
+	}
+	for id := range r.prs {
+		if id == r.id {
+			continue
+		}
+		r.logger.Infof("%x [logterm: %d, index: %d] sent %s request to %x at term %d",
+			r.id, r.raftLog.lastTerm(), r.raftLog.lastIndex(), voteMsg, id, r.Term)
+
+		var ctx []byte
+		if t == campaignTransfer {
+			ctx = []byte(t)
+		}
+		r.send(pb.Message{Term: term, To: id, Type: voteMsg, Index: r.raftLog.lastIndex(), LogTerm: r.raftLog.lastTerm(), Context: ctx})
+	}
+}
+```
+
+
+根据`Vote`或者`PreVote`返回对应的Resp类型
+
+```go
+// voteResponseType maps vote and prevote message types to their corresponding responses.
+func voteRespMsgType(msgt pb.MessageType) pb.MessageType {
+	switch msgt {
+	case pb.MsgVote:
+		return pb.MsgVoteResp
+	case pb.MsgPreVote:
+		return pb.MsgPreVoteResp
+	default:
+		panic(fmt.Sprintf("not a vote message: %s", msgt))
+	}
+}
+```
+
 ## Step
 
 `Step()`是raft处理消息的入口，当node处理这些channel的时候会调用Step去处理这些接受的消息
@@ -1174,6 +1286,9 @@ raft有一个同样的消息处理函数`Step()`，每个角色还有自己特�
 - preCandidate: stepCandidate
 - leader: stepLeader
 
+
+### Step()
+
 来看`Step()`函数
 
 第一个switch检查 term
@@ -1185,30 +1300,63 @@ raft有一个同样的消息处理函数`Step()`，每个角色还有自己特�
             - `r.checkQuorum` : 启用了leader quorum检查， TODO 有点奇怪，都启用quorum了还检查啥lease
             - `r.lead != None` 现在有leader
             - `r.electionElapsed < r.electionTimeout` election timout 没有超时
-        - `if !force && inLease`当不要求leader tranfser，并且在lease 范围内时，什么都不做，打印一条日志后返回。这是raft thesis 4.2.3 为了防止一个server从网络分区中恢复时推翻正常的leader。
+        - `if !force && inLease`当不要求leader tranfser，并且在lease 范围内时，什么都不做，打印一条日志后**返回**。这是raft thesis 4.2.3 为了防止一个server从网络分区中恢复时推翻正常的leader。
     - 如果消息类型是`pb.MsgPreVote`，不改变term ，这里force可以为true也也可以为false，但是inLease 一定是false的
     - 如果消息类型是`pb.MsgPreVotResp`，并且它没有拒绝，同样什么都不干 // TODO 好像不太对耶，peer的term比我们大，还不拒绝…… 
     - 其他情况下，需要切换为follower，不管之前是什么状态
         - 如果消息是`pb.MsgApp`,`pb.MsgHeartbeat`,`pb.MsgSnap`这些只能从leader发来的消息，我们就认为发送方是leader，调用`r.becomeFollower(m.Term, m.From)`
         - 其他情况下，我们也不知道现在的leader 是谁`r.becomeFollower(m.Term, None)`
+    - 这些消息还会在下一个switch里面继续处理
 - 如果消息的term 比自己的term 要小，分下面几种情况（最后不管什么情况都会直接返回nil，不再继续处理）
     - 如果同时满足这两种情况
 	    - `(r.checkQuorum || r.preVote)`启用了`checkQuorum`或者启用了`preVote`
         - `(m.Type == pb.MsgHeartbeat || m.Type == pb.MsgApp)`这是heartbeat或者append rpc消息 
-        - 这些消息只能来自leader,两种可能 1) leader消息延迟 2) 本节点从网络分区中恢复，因此term 比 leader要高
-            - TODO 这一大段注释没看懂
-            - 最后发送一条`MsgAppResp`，并且接受这条消息（Reject 默认为 false），`MsgHeartBeat`也用`MsgAppRes`来回复？
+        - 这些消息只能来自leader,两种可能 1) leader消息延迟 2) 本节点从网络分区中恢复（恢复前一直尝试增加term来竞选leader），因此term 比 leader要高。这里的逻辑相当负责，涉及到两个标志位，两种不同的消息，两种不同的情况，试着稍微简化一下，比如 
+            - 情况1： `if r.checkQuorum && m.Type == pb.MsgApp`，
+                - 如果`r.checkQuorum`为false，就不会进去这个分支
+                    - 如果是leader消息延迟，不回复似乎也可以，因为leader不检查quorum，他不会退下来
+                    - 如果是是本节点从网络分区恢复，//TODO 它没法加入一个lower term的集群，需要别的地方去处理。
+                - 如果`r.checkQuorum`为true, 那么收到leader消息的时候
+                    - 如果是leader消息延迟，回复leader的消息并没有坏处（这里回复了Reject: false承认leader的地位）,否则leader可能因为quorum不够退下来
+                    - 如果是本节点从网络分区恢复，同样的1：承认leader地位，防止他退下来；2：//TODO: 需要别的方式重新加入lower term的集群
+			- 情况2： `if r.preVote && m.Type == pb.MsgAp`，
+                - 如果`r.preVote`为false，同样不会进入这个分支
+                    - 不管是哪种情况，不回复，我们会接着发`MsgVote`迫使集群所有节点更新term并转换为follower，election timeout之后重新发起选举
+                - 如果`r.preVote`为true
+                    - 如果如果是leader消息延迟，同样回复leader的消息并没有坏处（特别是checkquorum为true的话）
+                    - 如果是本节点从网络分区恢复，`preVote`注定了我们不能得到多数派的认可，同样回复回复leader的消息并没有坏处。 // TODO， 这里需要别的方式重新加入lower term的集群
+            - 总之j如果进入了这个分支，发送一条`MsgAppResp`承认leader的地位（哪怕别的什么都不做），`MsgHeartBeat`也用`MsgAppRes`来回复？
 	- 否则，如果消息是`pb.MsgPreVote`，直接发一条`pb.MsgPreVoteResp`拒绝这个请求
         - TODO 那段注释的意思是这样吗？ 如果不回复的话会导致死锁，因为这样precandidate不知道新的term是什么。
         - 这样只是这个precandidate死锁吧？
 	- 其他所有情况直接忽略掉，不回复
 	- 之后返回nil不再继续处理
 
+第二个switch检查消息的类型
+
+- `pb.MsgHup` 发起竞选，这是一条本地消息
+    - 检查已经commit但是还没有apply的log entry，如果里面有(pending的)配置变更，取消选举
+	- `r.campaign(campaignElection)`或者`r.campaign(campaignPreElection)`发起选举
+- `pb.MsgVote` 或者 `pb.MsgPreVote`
+    - 如果我是一个learner (non voting member)，直接返回，看注释有个TODO
+    - 看看我们是不是有选举权，当满足下面三个条件之一的时候：
+        - `r.Vote == m.From`  本term我们已经给发送方投过一次了, r.Vote每个term都会重置
+        - `r.Vote == None && r.lead == None` 我们还没投过票，并且现在没有leader
+        - `m.Type == pb.MsgPreVote && m.Term > r.Term` 来在未来 term 的 prevote，（可能是leader挂了之后，第一个timeout的节点发起的；也有可能是对方刚从网络分区中恢复）
+    - 如果我们有选举权，并且对方的log是UpToDate的，就投他
+        - 注意回复的消息里面Term是message的term，而不是自己的term。这样一个从网络分区中恢复的node（并且log uptodate的话）才有可能当选为新的leader，否则它会忽略包含过期term的消息。TODO 如果它的log不是uptodate，它怎么重新加会集群?
+        - 如果这是Vote请求，重置election timeout，并记住自己给谁投了票
+    - 否则拒绝对方，返回自己的term，哪怕这个term小于对方
+- 对于其他类型的消息，让角色特有的stepfunc去处理
 
 raft thesis 4.2.3 
 > We modify the RequestVote RPC to achieve this: if a server receives a RequestVote
 request within the minimum election timeout of hearing from a current leader, it does not update its
 term or grant its vote.
+
+so...
+- Vote: 对比最后一条log的term 和 index
+- PreVote：对比对方和自身的term`
 
 ```go
 func (r *raft) Step(m pb.Message) error {
@@ -1356,23 +1504,20 @@ func (r *raft) Step(m pb.Message) error {
 }
 ```
 
-campaignType 包括
+
+
+## Other
+
+检查Entry有几个（pending的）配置变更
 ```go
-
-// CampaignType represents the type of campaigning
-// the reason we use the type of string instead of uint64
-// is because it's simpler to compare and fill in raft entries
-type CampaignType string
-
-// Possible values for CampaignType
-const (
-	// campaignPreElection represents the first phase of a normal election when
-	// Config.PreVote is true.
-	campaignPreElection CampaignType = "CampaignPreElection"
-	// campaignElection represents a normal (time-based) election (the second phase
-	// of the election when Config.PreVote is true).
-	campaignElection CampaignType = "CampaignElection"
-	// campaignTransfer represents the type of leader transfer
-	campaignTransfer CampaignType = "CampaignTransfer"
-)
+func numOfPendingConf(ents []pb.Entry) int {
+	n := 0
+	for i := range ents {
+		if ents[i].Type == pb.EntryConfChange {
+			n++
+		}
+	}
+	return n
+}
 ```
+
