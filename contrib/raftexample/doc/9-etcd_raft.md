@@ -1466,7 +1466,8 @@ raft有一个同样的消息处理函数`Step()`，每个角色还有自己特�
         - 注意回复的消息里面Term是message的term，而不是自己的term。这样一个从网络分区中恢复的node（并且log uptodate的话）才有可能当选为新的leader，否则它会忽略包含过期term的消息。TODO 如果它的log不是uptodate，它怎么重新加会集群?
         - 如果这是Vote请求，重置election timeout，并记住自己给谁投了票
     - 否则拒绝对方，返回自己的term，哪怕这个term小于对方
-- 对于其他类型的消息，让角色特有的stepfunc去处理
+- 
+- 对于其他类型的消息，让角色特有的stepfunc去处理，并返回这些函数的处理结果
 
 raft thesis 4.2.3 
 > We modify the RequestVote RPC to achieve this: if a server receives a RequestVote
@@ -1475,7 +1476,7 @@ term or grant its vote.
 
 so...
 - Vote: 对比最后一条log的term 和 index
-- PreVote：对比对方和自身的term`
+- PreVote：对比对方和自身的term
 
 ```go
 func (r *raft) Step(m pb.Message) error {
@@ -1623,9 +1624,22 @@ func (r *raft) Step(m pb.Message) error {
 }
 ```
 
-下面逐一观察每个角色的step处理流程
+下面逐一观察每个角色的step处理流程，全都是简单的`switch m.Type`
 
 ### stepFollower
+
+follower的处理逻辑
+
+> 当收到pb.MsgApp pb.MsgHeartbeat pb.MsgSnap 这三种类型消息是都会重置r.electionElapsed，并把leader 更新为发送者
+
+- pb.MsgProp: 转发给leader，如果没有禁用forward
+- pb.MsgApp: 调用`r.handleAppendEntries(m)`追加entry
+- pb.MsgHeartBeat: 调用`r.handleHeartbeat(m)`处理心跳
+- pb.MsgSnap: 调用`r.handleSnapshot(m)`加载快照
+- pb.MsgTransferLeader: leader transfer请求，需要转发给leader去处理
+- pb.MsgTimeoutNow: raft thesis 3.10 描述了这个rpc，当transfer target的log跟master 符合的时候，master给target server发送这个rpc。这里是target server收到这个rpc的处理流程，调用`r.campaign(campaignTransfer)`后变成candiate，自增term发起竞选。
+- pb.MsgReadIndex： 转发给leader
+- pb.MsgReadIndexResp： 对readonly的回复？ 网readStates里面append了一个`ReadState{Index: m.Index, RequestCtx: m.Entries[0].Data}` TODO
 
 ```go
 func stepFollower(r *raft, m pb.Message) error {
@@ -1688,6 +1702,23 @@ func stepFollower(r *raft, m pb.Message) error {
 ```
 
 ### stepCandidate
+
+这个函数同时处理candidate和precandiate两种状态
+
+> 当收到pb.MsgApp pb.MsgHeartbeat pb.MsgSnap 这三种类型消息时都会自动退回follower状态，并调用响应的处理流程
+
+- pb.MsgProp: 不处理，直接drop
+- pb.MsgApp: 退回follower，调用`r.handleAppendEntries(m)`追加entry
+- pb.MsgHeartBeat: 退回follower，调用`r.handleHeartbeat(m)`处理心跳
+- pb.MsgSnap: 退回follower，调用`r.handleSnapshot(m)`加载快照
+- pb.MsgPreVoteResp或者pb.MsgVoteResp： 收到了对Msg(Pre)Vote的回复（这是在Campaign里面发的），收到后进行计票。这里有点反直觉，通过`switch r.quorum()`跟票数对比
+    - gr：满足quorum了
+        - 如果我是precandiate，`r.campaign(campaignElection)`正式发起竞选
+        - 否则直接切换为leader，并广播一次Append RPC
+    - len(r.votes) - gr: 
+        - 假设5节点的集群，目前收到2票， gr = 2， `len(r.votes) - gr` = 3
+- pb.MsgTimeoutNow: 忽略这个请求
+
 
 ```go
 // stepCandidate is shared by StateCandidate and StatePreCandidate; the difference is
