@@ -536,6 +536,38 @@ func (r *raft) hardState() pb.HardState {
 }
 ```
 
+## Quorum
+
+`checkQuorumActive()`检查所有的voter，如果多数派最近有动静`pr.RecentActive`则返回true
+
+```go
+func (r *raft) quorum() int { return len(r.prs)/2 + 1 }
+
+// checkQuorumActive returns true if the quorum is active from
+// the view of the local raft state machine. Otherwise, it returns
+// false.
+// checkQuorumActive also resets all RecentActive to false.
+func (r *raft) checkQuorumActive() bool {
+	var act int
+
+	r.forEachProgress(func(id uint64, pr *Progress) {
+		if id == r.id { // self is always active
+			act++
+			return
+		}
+
+		if pr.RecentActive && !pr.IsLearner {
+			act++
+		}
+
+		pr.RecentActive = false
+	})
+
+	return act >= r.quorum()
+}
+```
+
+
 ## 发送消息
 
 ### 发送Append
@@ -700,6 +732,16 @@ func (r *raft) sendHeartbeat(to uint64, ctx []byte) {
 	}
 
 	r.send(m)
+}
+```
+
+## timeoutnow
+
+这条消息通知leader transfer的target马上发起竞选
+
+```go
+func (r *raft) sendTimeoutNow(to uint64) {
+	r.send(pb.Message{To: to, Type: pb.MsgTimeoutNow})
 }
 ```
 
@@ -915,6 +957,8 @@ var globalRand = &lockedRand{
 - 取消leadertransfer
 - 重置每一个voter/learner的Progress状态
 
+- 除了becomePrecandiate，其他状态都会调用这个函数
+
 ```go
 func (r *raft) reset(term uint64) {
 	if r.Term != term {
@@ -986,10 +1030,10 @@ func (r *raft) becomeCandidate() {
 
 ### precandidate
 
-`becomePreCandidate()`只有启用PreVote的时候才会调用，跟`becomeCandiate()`类似，但是：
+`becomePreCandidate()`只有启用PreVote的时候才会调用
+- 不调用`r.reset()`，但是重新分配`r.votes`
 - 不增加term
 - 不给自己投票
-- 需要征求voter的意见(r.votes)
 
 ```go
 func (r *raft) becomePreCandidate() {
@@ -1208,7 +1252,6 @@ func (r *raft) maybeCommit() bool {
 	return r.raftLog.maybeCommit(mci, r.Term)
 }
 
-func (r *raft) quorum() int { return len(r.prs)/2 + 1 }
 ```
 
 ## Uncommit Quota
@@ -1305,8 +1348,12 @@ const (
 )
 ```
 
+### poll()
+
 `poll()`函数接收投票结果，并返回获得的票数 （这个函数需要多次调用，每个node一次,并且每个node投多次的花只算第一次）
 它的三个参数分别表示谁（`id`），发了什么类型的消息（`v`，preVote或者Vote），结果是什么（`v` 同意或者拒绝)
+
+这里注意一下r.votes的大小是每次调用`poll()`之后才会增加的，`len(r.votes)`表示已经有多少节点投票，`len(r.votes) - granted`可以计算出（已经投票的节点中）有多少节点投了反对票。后面`stepCandiate`中会用到这个。
 
 ```go
 func (r *raft) poll(id uint64, t pb.MessageType, v bool) (granted int) {
@@ -1326,6 +1373,8 @@ func (r *raft) poll(id uint64, t pb.MessageType, v bool) (granted int) {
 	return granted
 }
 ```
+
+### campaign()
 
 (Pre)Candidate调用`campaign()`给自己拉票，
 根据是ProVote还是Vote组装不同的消息`voteMsg`， 注意对于`PreVote`，发送的term会设置为当前r.term + 1（因为它后面要是发Vote的话，会自增term）
@@ -1715,8 +1764,7 @@ func stepFollower(r *raft, m pb.Message) error {
     - gr：满足quorum了
         - 如果我是precandiate，`r.campaign(campaignElection)`正式发起竞选
         - 否则直接切换为leader，并广播一次Append RPC
-    - len(r.votes) - gr: 
-        - 假设5节点的集群，目前收到2票， gr = 2， `len(r.votes) - gr` = 3
+    - len(r.votes) - gr: 计算已经投票的节点里面有多少投了反对票(见`poll()`的注释)，如果这个满足quorum，切回follower状态，leader未知
 - pb.MsgTimeoutNow: 忽略这个请求
 
 
@@ -1770,6 +1818,50 @@ func stepCandidate(r *raft, m pb.Message) error {
 ```
 
 ### stepLeader
+
+检查msg type，分为两部分
+
+第一部分 leader 可以直接处理的
+
+- pb.MsgBeat: `tickHeartBeat()`时触发的，广播一条心跳
+- pb.MsgCheckQuorum：同样是`tickHeartBeat()`里面，election timeout时出发的。如果多数派的follower不active（比如leader网络分区了），退为follower
+- pb.MsgProp: 应用提交一个请求
+    - 如果自己不在voter中（比如配置变更把leader移除了），或者正在做leader transfer，直接drop请求
+    - 如果请求里面包含配置变更
+        - 如果前面已经有还没有应用的配置变更`r.pendingConfIndex > r.raftLog.applied`，悄悄的丢掉这个变更请求，把它替换为一个空的`Type: pb.EntryNormal`\
+        - 否则把`r.pendingConfIndex`更新到这条entry的index之后，阻止这段时间之内的其他配置变更
+    - 把m.Entries追加到log中并广播append RPC
+- MsgReadIndex： 处理readonly请求
+   - 如果是多节点集群`r.quorum() > 1`
+       - `r.raftLog.zeroTermOnErrCompacted(r.raftLog.term(r.raftLog.committed)) != r.Term`检查最后一条commit的 log是不是当前term的，如果不是，返回nil，因为我现在也不知道哪些log是可以安全commit的。
+       - 根据`r.readOnly.option`进一步处理
+           - 如果是`ReadOnlySafe`，添加一条readonly request，通过心跳广播出去，Context设置为readonly 的`m.Entries[0].Data` // TODO 后续处理在哪？
+           - 如果是`r.raftLog.committed`,直接回复所有节点说当前安全的readonly是当前leader 的 commit index。
+   - 如果是单节点集群，直接给自己的readStates append 当前的commint index
+  
+第二部分要根据发送方的progress再近一步分析的
+
+- pb.MsgAppResp:
+    - 先标记`pr.RecentActive = true`
+    - 如果append rpc被拒绝
+        - 调用`pr.maybeDecrTo(m.Index, m.RejectHint)`把Next 回退到 rejecthint指定的index
+        - 如果peer的progress状态是ProgressStateReplicate，设置为probe
+        - 给这个peer重新发append rpc，这次多半会成功
+    - 如果append rpc被接受了，并且leader更新了这个progress的index `pr.maybeUpdate(m.Index)`
+        - 根据peer的当前状态执行不同的操作
+            - probe ==> replicate
+            - snapshot 并且 snapshot已经过时了 ==> probe
+            - replciate ==> `pr.ins.freeTo(m.Index)`把infligt的index释放到`m.Index`，follower正常接收append rpc的话会把m.Index设置为自己最后一条log 的 index
+        - `if r.maybeCommit()`如果此时有log 能commit的话，再次广播一条append rpc
+        - 如果没有东西可以commit但是发送方之前的状态是暂停的，它可能不知道最新消息，单独给他发一条
+        - 前面已经设置了flow control，这时候如果还有消息要发，尝试用一个for循环全发出去`for r.maybeSendAppend(m.From, false) {}` 
+        - 最后，如果目标是leader transfer 的target，并且对方的log跟自己match的话，调用`r.sendTimeoutNow(m.From)`让他马上发起竞选 // follower 在 `stepFollower()`的`pb.MsgTimeoutNow`中处理
+- pb.MsgHeartbeatResp:
+    - 标记RecentActive，resume progress
+    - 如果peer的inflight 满了，释放第一个 // 所以这有可能突破上限了？
+    - 接下来是对readonly的处理，如果没用启用quorum或者心跳没有带上context就返回
+    - 检查ackCount是否满足quorum
+    - 是的话让readindex advance到对应的消息对应context，给所有peer回复`MsgReadIndexResp`现在安全的read index
 
 ```go
 func stepLeader(r *raft, m pb.Message) error {

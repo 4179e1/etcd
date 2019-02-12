@@ -1015,6 +1015,13 @@ func (pr *Progress) needSnapshotAbort() bool {
 }
 ```
 
+### RecentActive 
+
+RecentActive 是checkquorum启用时leader用这个状态检查自己是不是合法的leader
+- 当leader收到`pb.MsgAppResp`,`pb.MsgHeartBeatResp`时置true
+- 添加节点时置true
+- leader调用`checkQuorumActive()`检查时重置为false
+
 ## readOnly
 
 raft thesis 6.4 讨论的只读查询，不需要append log。
