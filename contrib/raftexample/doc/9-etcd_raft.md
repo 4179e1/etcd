@@ -1032,7 +1032,7 @@ func (r *raft) becomeCandidate() {
 
 `becomePreCandidate()`只有启用PreVote的时候才会调用
 - 不调用`r.reset()`，但是重新分配`r.votes`
-- 不增加term
+- **不增加term**，这一点很重要，对于出现网络分区的节点来说他会一直尝试prevote，并且一直失败，但是term不增加。因此网络恢复后就能正常作为follower加入集群。
 - 不给自己投票
 
 ```go
@@ -1154,7 +1154,7 @@ leader专属，除了累加electionElapsed以外，还会累加heartbeatElapsed
 
 - 当election  timeout时
   - 重置r.electionElapsed
-  - 如果启用了checkQuorum， step一条`pb.MsgCheckQuorum`的消息，检查自己是否还是合法的leader //TODO，这个什么时候会返回？
+  - 如果启用了checkQuorum， step一条`pb.MsgCheckQuorum`的消息，检查自己是否还是合法的leader
   - 如果一个election timeout之内还没法完成leader transfer,直接取消
 - 如果自己不再是leader了，直接返回吧
 - 最后是heartbeat的处理，每当heartbeat timeout，step 一条`pb.MsgBeat`
@@ -1479,21 +1479,22 @@ raft有一个同样的消息处理函数`Step()`，每个角色还有自己特�
     - 如果同时满足这两种情况
 	    - `(r.checkQuorum || r.preVote)`启用了`checkQuorum`或者启用了`preVote`
         - `(m.Type == pb.MsgHeartbeat || m.Type == pb.MsgApp)`这是heartbeat或者append rpc消息 
-        - 这些消息只能来自leader,两种可能 1) leader消息延迟 2) 本节点从网络分区中恢复（恢复前一直尝试增加term来竞选leader），因此term 比 leader要高。这里的逻辑相当负责，涉及到两个标志位，两种不同的消息，两种不同的情况，试着稍微简化一下，比如 
+        - 这些消息只能来自leader,两种可能 1) leader消息延迟 2) 本节点从网络分区中恢复（恢复前一直尝试竞选leader），因此term 比 leader要高。这里的逻辑相当复杂，涉及到两个标志位，两种不同的消息，两种不同的情况，试着稍微简化一下，比如 
             - 情况1： `if r.checkQuorum && m.Type == pb.MsgApp`，
                 - 如果`r.checkQuorum`为false，就不会进去这个分支
                     - 如果是leader消息延迟，不回复似乎也可以，因为leader不检查quorum，他不会退下来
-                    - 如果是是本节点从网络分区恢复，//TODO 它没法加入一个lower term的集群，需要别的地方去处理。
+                    - 如果是是本节点从网络分区恢复，道理同上
                 - 如果`r.checkQuorum`为true, 那么收到leader消息的时候
                     - 如果是leader消息延迟，回复leader的消息并没有坏处（这里回复了Reject: false承认leader的地位）,否则leader可能因为quorum不够退下来
-                    - 如果是本节点从网络分区恢复，同样的1：承认leader地位，防止他退下来；2：//TODO: 需要别的方式重新加入lower term的集群
+                    - 如果是本节点从网络分区恢复，同样的1：承认leader地位，防止他退下来；
+                    - 只是……如果我们没有启用prevote，我们的MsgVote最终会打断leader
 			- 情况2： `if r.preVote && m.Type == pb.MsgAp`，
-                - 如果`r.preVote`为false，同样不会进入这个分支
+                - 如果`r.preVote`为false，同样不会进入这个分支。并且他会不断的递增自己的term。
                     - 不管是哪种情况，不回复，我们会接着发`MsgVote`迫使集群所有节点更新term并转换为follower，election timeout之后重新发起选举
                 - 如果`r.preVote`为true
                     - 如果如果是leader消息延迟，同样回复leader的消息并没有坏处（特别是checkquorum为true的话）
-                    - 如果是本节点从网络分区恢复，`preVote`注定了我们不能得到多数派的认可，同样回复回复leader的消息并没有坏处。 // TODO， 这里需要别的方式重新加入lower term的集群
-            - 总之j如果进入了这个分支，发送一条`MsgAppResp`承认leader的地位（哪怕别的什么都不做），`MsgHeartBeat`也用`MsgAppRes`来回复？
+                    - 如果是本节点从网络分区恢复，`preVote`注定了1)恢复前后后我们不能得到多数派的认可；2）我们的term不会递增，因此恢复之后可以正常作为follower收到Append rpc从而跟leader保持一致。
+            - 总之如果进入了这个分支，发送一条`MsgAppResp`承认leader的地位（哪怕别的什么都不做），`MsgHeartBeat`也用`MsgAppRes`来回复？
 	- 否则，如果消息是`pb.MsgPreVote`，直接发一条`pb.MsgPreVoteResp`拒绝这个请求
         - TODO 那段注释的意思是这样吗？ 如果不回复的话会导致死锁，因为这样precandidate不知道新的term是什么。
         - 这样只是这个precandidate死锁吧？
@@ -1862,6 +1863,17 @@ func stepCandidate(r *raft, m pb.Message) error {
     - 接下来是对readonly的处理，如果没用启用quorum或者心跳没有带上context就返回
     - 检查ackCount是否满足quorum
     - 是的话让readindex advance到对应的消息对应context，给所有peer回复`MsgReadIndexResp`现在安全的read index
+- pb.MsgSnapStatus:
+    - 如果peer成功接收snapshot，probe progress
+    - 如果peer无法成功接收snapshot，取消snapshot，然后probe
+- pb.MsgUnreachable
+    - 如果一个节点被报告unreachable，把它的状态切换为probe ，实际好像没有谁发这个消息
+- pb.MsgTransferLeader
+    - 先确保target 不是learner
+    - 如果之前已经有leader transfer，并且是同一个target，返回；否则取消之前的transfer
+    - 确保不是transfer给自己
+    - 因为transfer 需要在election timeout之内完成，先重置一下这个计时器
+    - 如果target的log已经match，调用`r.sendTimeoutNow(leadTransferee)`让target发起竞选。否则先给他发append rpc把log 补齐再说
 
 ```go
 func stepLeader(r *raft, m pb.Message) error {
@@ -2096,3 +2108,6 @@ func numOfPendingConf(ents []pb.Entry) int {
 }
 ```
 
+
+## Reference
+[Pre-voting in distributed consensus](https://davecturner.github.io/2017/08/17/paxos-pre-voting.html)
