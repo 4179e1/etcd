@@ -190,7 +190,7 @@ type raft struct {
 
 	votes map[uint64]bool  // preVote 阶段用来收集voter，我要是去竞选leader，你会给我投票吗？
 
-	msgs []pb.Message   // TODO
+	msgs []pb.Message   // raft 要发的消息，由node.Ready()取走发送
 
 	// the leader id
 	lead uint64 
@@ -242,13 +242,13 @@ type raft struct {
 ## 新建Raft数据结构
 
 - 首先通过`c.validate()`验证配置的有效性
-- `raftlog := newLogWithSize(c.Storage, c.Logger, c.MaxCommittedSizePerReady)` 新建`raftlog`对象  //TODO
+- `raftlog := newLogWithSize(c.Storage, c.Logger, c.MaxCommittedSizePerReady)` 新建`raftlog`对象
 - `hs, cs, err := c.Storage.InitialState()`获取初始的hardstate和confstate，ConfState中包含`Nodes`和`Learners`
 - peers 和 learners是后面用来初始化`prs`和`learnerPrs`的，他们的值
   - 要么是初次启动时从Confg中设置，这种方式貌似并没有使用，而是在`node.StartNode()`时直接调用`raft.addNode()`添加
   - 要么是从Storage中读出来（上面的cs，来自快照）
 - 使用传入的Config初始化raft数据结构
-- 根据上面的peers和learners初始化`prs`和`learnerPrs`，这仅在有快照的情况下发生。 //TODO
+- 根据上面的peers和learners初始化`prs`和`learnerPrs`，这仅在有快照的情况下发生，参考[etcd_raft_complement](./10-etcd_raft_complement.md)
 - 如果storage中的hardstate非空，加载进来
 - 如果c.Applied > 0，直接`raftlog.appliedTo(c.Applied)`应用到这个log //TODO 什么场景会用这个功能？
 - 不管三七二十一，先`r.becomeFollower(r.Term, None)`把自己变成follower再说
@@ -455,7 +455,6 @@ func (r *raft) addNodeOrLearnerNode(id uint64, isLearner bool) {
 
 删完节点之后要做的两个额外处理
 
-TODO:下列函数的实现
 - 现在quorum变小了，看看是不是能commit了`r.maybeCommit()`，是的话`r.bcastAppend()`
 - 如果我是leader并且被删除的是leader transfer的目标，`r.abortLeaderTransfer()`
 
@@ -576,7 +575,7 @@ func (r *raft) checkQuorumActive() bool {
 - 如果peer已经pause，则暂停发送
 - `term, errt := r.raftLog.term(pr.Next - 1)`获取上一条Log的term，用于log match
 - `ents, erre := r.raftLog.entries(pr.Next, r.maxMsgSize)`获取最大为`r.maxMsgSize`的entries
-- 如果取不到term 或者 ents，说明peer的状态是空的，它大概一条entry都没有，组装一个snapshot 算了(`m.Type = pb.MsgSnap`) // TODO
+- 如果取不到term 或者 ents，说明peer的状态是空的，它大概一条entry都没有，组装一个snapshot 算了(`m.Type = pb.MsgSnap`)
   - 如果` r.raftLog.snapshot()`报错说`ErrSnapshotTemporarilyUnavailable`，就返回好了，晚点再试；如果是其他错误，我也不知道是啥，好慌 ，还是panic吧
   - 调用`pr.becomeSnapshot(sindex)`把peer状态变为snapshot, （`IsPaused()`会返回True）
 - 如果peer有状态，那就发正常的AppenEntries RPC (`m.Type = pb.MsgApp`)
@@ -587,7 +586,7 @@ func (r *raft) checkQuorumActive() bool {
 	  - `last := m.Entries[n-1].Index`先获取最后一条entry的index
 	  - `pr.optimisticUpdate(last)`把peer的Next index更新为要发送的最后一条
 	  - `pr.ins.add(last)`把这个index加到progress的inflight （滑动窗口）中
-	- 如果是`ProgressStateProbe`，发完这一条就得先暂停一下了，//TODO，谁再把probe打开？
+	- 如果是`ProgressStateProbe`，发完这一条就得先暂停一下了，(leader收到心跳之后会resume，还有一些别的情况也会resume)
 - 最后调用`m.send`把组装好的消息发出去
 
 ```go
@@ -668,8 +667,8 @@ func (r *raft) maybeSendAppend(to uint64, sendIfEmpty bool) bool {
 ### send - 实际发送
 
 `send()`需要检查Term的合法性，
-- Leader election相关的消息需要，//TODO Resp中Term的含义，如果我接受选举，Leader的Term至少应该是
-- 其他类型的消息不需要 //TODO
+- Leader election相关的消息需要，不同小气Resp中Term的含义有些微妙的区别
+- 其他类型的消息不需要
   - 但是pb.MsgProp 和 pb.MsgReadIndex 会自动把自己的`r.Term`带上，注释没看太明白，不过这两种消息是需要forward给leader的
 
 最后把这些消息添加到r.msgs中，node.Ready()会取走这些msgs，应用层需要自己把这些消息发出去

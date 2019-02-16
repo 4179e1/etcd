@@ -255,7 +255,7 @@ type raftLog struct {
 // recovers the log to the state that it just commits and applies the
 // latest snapshot.
 func newLog(storage Storage, logger Logger) *raftLog {
-	return newLogWithSize(storage, logger, noLTODO 
+	return newLogWithSize(storage, logger, noLimit) 
 }
 
 // newLogWithSize returns a log using the given storage and max
