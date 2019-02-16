@@ -159,3 +159,86 @@ func (ro *readOnly) recvAck(m pb.Message) int {
 
 
 5 最终由 node.ready取走readonly
+
+## Propose
+
+- 如果是follower，转发给leader
+- stepLeader 中处理`pb.MsgProp`时调用
+  - `r.appendEntry()`
+    - 调用`li = r.raftLog.append(es...)`添加到自己的unstable log中
+	- 调用`r.maybeCommit()`更新log 的 commit index （这里处理的是之前log entry)
+  - `r.bcastAppend()`
+    - 对每个voter和learner循环调用 `r.sendAppend(id)`，也就是`r.maybeSendAppend(to, true)`
+	  - 这里组装一条`pb.MsgApp`追加到`r.msg`中，包含最新的entry和commit index
+
+应用层通过`node.ready()`取走r.msg并发送
+
+- setpFollower收到后调用`r.handleAppendEntries(m)`处理接收的消息
+  - 调用`r.raftLog.maybeAppend`尝试追加
+    - 调用`l.append(ents[ci-offset:]...)`把entry追加到unstable中
+    - 调用`l.commitTo(min(committed, lastnewi))`尝试commit
+  - 根据上一个函数的结果，返回`pb.MsgAppResp`表示接受或者拒绝
+    - 如果被拒绝就调用`pr.maybeDecrTo(m.Index, m.RejectHint)`减少Next值，重新`r.sendAppend(m.From)`
+	- 如果接受了
+	  - 调用`r.maybeCommit()`， 如果commit index增加了，广播`r.bcastAppend()`
+	  - 循环调用`r.maybeSendAppend(m.From, false)`把所有log 发出去
+
+## 应用层处理 Ready()
+
+```go
+		// store raft entries to wal, then publish over commit channel
+		case rd := <-rc.node.Ready():
+			rc.wal.Save(rd.HardState, rd.Entries)
+			if !raft.IsEmptySnap(rd.Snapshot) {
+				rc.saveSnap(rd.Snapshot)
+				rc.raftStorage.ApplySnapshot(rd.Snapshot)
+				rc.publishSnapshot(rd.Snapshot)
+			}
+			rc.raftStorage.Append(rd.Entries)
+			rc.transport.Send(rd.Messages)
+			if ok := rc.publishEntries(rc.entriesToApply(rd.CommittedEntries)); !ok {
+				rc.stop()
+				return
+			}
+			rc.maybeTriggerSnapshot()
+			rc.node.Advance()
+```
+
+两个重要的地方
+1 rc.raftStorage.Append(rd.Entries) - 追加到memory storage
+
+2 rc.node.Advance() - 通知raft advance
+
+```go
+		case <-advancec:
+			if applyingToI != 0 {
+				r.raftLog.appliedTo(applyingToI)
+				applyingToI = 0
+			}
+			if havePrevLastUnstablei {
+				r.raftLog.stableTo(prevLastUnstablei, prevLastUnstablet)
+				havePrevLastUnstablei = false
+			}
+			r.raftLog.stableSnapTo(prevSnapi)
+			advancec = nil
+```
+
+- `r.raftLog.appliedTo(applyingToI)`如果有applied的数据(rd.CommittedEntries，或者snapshot)，更新apply index
+- `r.raftLog.stableTo(prevLastUnstablei, prevLastUnstablet)`如果有append unstablelog (rd.entries)，丢弃不再需要的unstable entry.
+
+
+### MemoryStorage 和 unstable
+
+raftlog中包含了MemoryStorage和unstable，这两个东西的关系我一直很迷糊。
+其实是这样
+- MemoryStorage保存的是已经持久化的log；unstable顾名思义，就是没持久化的log。
+- 回放wal的时候，会把已经持久化的log放到MemoryStroage中，unstable是空的。
+
+- 当propose进来的时候，会先把log entry放到unstable中
+- leader把广播AppendEntries rpc的时候，每个raft node都会收到这些unstable
+  - 应用层通过`node.Ready()`拿到这些unstable entry，持久化后放到MemoryStorage中
+  - `node.Advance()`通知raft把已经持久化的unstable删掉。
+
+- 总之上面的过程完成了log 从 unstable 转移到 MemoryStorage的过程。（中间做了持久化）。
+
+- 当leader需要获取log entry（比如发给follower）的时候，把MemoryStorage 和 unstable 联合起来做查询.
