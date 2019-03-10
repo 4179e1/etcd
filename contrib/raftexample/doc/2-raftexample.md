@@ -831,13 +831,13 @@ type Ready struct {
 - 首先`rc.wal.Save(rd.HardState, rd.Entries)`把硬状态和日志写到WAL中
 - 如果Ready状态中包含了快照，则直接应用这个快照，一个节点重启后可能缺了很多entry，直接用快照覆盖就完事了
   - 执行`rc.saveSnap()`保存快照，细分为
-    - `rc.wal.SaveSnapshot(walSnap)`把快照Metadata的两项(`Metadata.Index`, 和 `Metadata.term`)保存到WAL中,Index和Term用来在重启回放快照和WAL时，确保他们的状态是一致的。这里不保存快照的内容。           
+    - `rc.wal.SaveSnapshot(walSnap)`把快照Metadata的两项(`Metadata.Index`, 和 `Metadata.term`)保存到WAL中,Index和Term用来在重启回放快照和WAL时，确保他们的状态是一致的。这里不保存快照的内容，只是记录一下我在这个时候做了个快照，replay的时候只要找到最后一个快照来加载，回放快照后面的WAL就可以了。
     - `rc.snapshotter.SaveSnap(snap)`把快照实际写入快照文件，文件命名为`<snapshot.Metadata.Term>-<snapshot.Metadata.Index>.snap`
     - `rc.wal.ReleaseLockTo(snap.Metadata.Index)`释放快照Index之前不再使用的WAL文件
-  - `rc.raftStorage.ApplySnapshot(rd.Snapshot)`把快照数据应用到Raft 存储中，
+  - `rc.raftStorage.ApplySnapshot(rd.Snapshot)`把快照数据应用到Raft 存储中，内部实现中只是把index和term更新为快照对应的值，并丢弃现有的所有log。快照可以认为是已经commit和apply的log，因此之前的东西不需要再保存了。
   - `rc.publishSnapshot(rd.Snapshot)`更新结构体的结构体的`confState`， `snapshotIndex`， `appliedIndex`三个字段，然后往rc.commitC写入通知KV store加载我们刚在`rc.snapshotter.SaveSnap(snap)`保存的快照文件
 - `rc.raftStorage.Append(rd.Entries)`把日志应用到raft 存储
-- `rc.transport.Send(rd.Messages)`把消息发给peers //TODO 具体怎么发的？
+- `rc.transport.Send(rd.Messages)`把消息发给peers
 - `rc.entriesToApply(rd.CommittedEntries)`找出还没有applied的日志，这里rd.CommittedEntries的index需要小于或等于已经applied index，不然中间就缺失了一些日志，绝对不能应用到状态机里面。而冗余的则通过这个函数去除。把这些还没有applid的日志找出来以后，通过`rc.publishEntries(rc.entriesToApply(rd.CommittedEntries))`发布给kvstore，后面再看这个函数。
 - `rc.maybeTriggerSnapshot()`判断是否要作一次本地快照，后面再议。
 - `rc.node.Advance()`通知raft我们已经保存了需要的数据，可以开始发下一批数据了。
@@ -963,6 +963,27 @@ func (rc *raftNode) maybeTriggerSnapshot() {
 	rc.snapshotIndex = rc.appliedIndex
 }
 ```
+
+### Raft Storage
+
+最后大家可能还有一个疑问，上文中的`rc.raftStorage`（类型为MemoryStorage）到底是干什么的？
+
+
+其实是这样，`raft.Node`中的`raftlog`中包含了MemoryStorage和unstable两部分：
+
+- MemoryStorage保存的是已经持久化的log；
+- unstable顾名思义，就是没持久化的log。
+- 回放wal的时候，会把已经持久化的log放到MemoryStroage中，unstable是空的。
+
+- 当propose进来的时候，会先把log entry放到unstable中
+- leader广播AppendEntries rpc的时候，每个raft node都会收到这些unstable
+  - 应用层通过`node.Ready()`拿到这些unstable entry，通过WAL持久化，然后放到MemoryStorage中
+  - `node.Advance()`通知raft把已经持久化的unstable删掉。
+
+- 总之上面的过程完成了log 从 unstable 转移到 MemoryStorage的过程
+
+- 当leader需要获取log entry（比如发给follower）的时候，把MemoryStorage 和 unstable 联合起来做查询.
+
 
 ## Reference
 

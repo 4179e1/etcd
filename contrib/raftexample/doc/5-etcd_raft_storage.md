@@ -17,7 +17,7 @@
 - 需要的时候raft查询storage得知哪些entry和state已经持久化（当然这是状态机做的）
 - 重启的时候从里面回放（storage的重建来自WAL）
 
-Node: Storage代表已持久化的log entry
+Note: Storage代表已持久化的log entry
 
 ## Raft Storage 接口
 
