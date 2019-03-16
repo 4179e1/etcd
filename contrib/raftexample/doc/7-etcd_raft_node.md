@@ -566,7 +566,7 @@ func (n *node) run(r *raft) {
 
 - 如果消息类型不是`pb.MsgProp`，则认为是收到一条消息
   - 直接发给`n.recv`。这条消息在在`run()`循环的`case m := <-n.recvc:`中交给raft去处理
-- 否则认为对于`pb.MsgProp`，发送给`n.proc`，在`run()`循环的`case pm := <-propc`中处理
+- 否则认为是`pb.MsgProp`，发送给`n.proc`，在`run()`循环的`case pm := <-propc`中处理
   - 如果不需要消息的处理结果，把messgae封装为`msgWithResult{m: m}`,`result`留空发给`n.proc`后直接返回nil。
   - 如果要结果的话设置`result`字段，发给`n.proc`之后等待返回值。
 
