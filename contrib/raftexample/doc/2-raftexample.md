@@ -22,7 +22,7 @@ Github上有人针对这些问题提过issue：
 
 > 冷知识 – 如何在git上下载一个patch文件？在Pull Request的链接上加上.patch，如上文的 [https://github.com/etcd-io/etcd/pull/9918.patch]
 
-因此raftexample的细节上未必经得起推敲，所以遇到疑惑的地方，不妨大胆的怀疑吧。看看这个怪异的实现，同样函数同样的参数执行两次，一次直接返回，另一次作为goroutine一直在后台接受请求。
+因此raftexample的细节上未必经得起推敲，所以遇到疑惑的地方，不妨大胆的怀疑吧。比如，看看原始版本中这个怪异的实现，同样函数同样的参数执行两次，一次直接返回，另一次作为goroutine一直在后台接受请求。
 
 ```go
 func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <-chan *string, errorC <-chan error) *kvstore {
@@ -58,7 +58,7 @@ func newKVStore(snapshotter *snap.Snapshotter, proposeC chan<- string, commitC <
 
 ## Key Value Store
 
-这个Key Value Store 本质上是一个Key Value的map，其中保存了所有已经commit的KV，它衔接了REST Server 和 raft server。(从REST server来的）请求Key Value update请求会经过这个store，然后发送到raft server。当raft server报告一个KV已经提交的时候，它更新自己的map。
+这个Key Value Store 本质上是一个Key Value的map，其中保存了所有已经applied的KV，它衔接了REST Server 和 raft server。(从REST server来的）请求Key Value update请求会经过这个store，然后发送到raft server。当raft server报告一个KV已经提交的时候，它更新自己的map。
 
 数据结构很简单, 核心就是kvstore，kv用于序列化/反序列化
 
@@ -79,7 +79,7 @@ type kv struct {
 
 newKVStore 返回一个新的kvsotre，需要传入四个参数
 
-- snapshotter复杂保存和加载快照， 后续文章会详细介绍这个对象
+- snapshotter 负责保存和加载快照， 后续文章会详细介绍这个对象
 - procposeC 用来提交请求，后续文章会详细描述其数据流向
 - commitC 用来接受（来自raft server的)committed的请求，后续文章会详细描述其数据流向
 - errorC 当收到错误时退出
@@ -141,8 +141,10 @@ func (s *kvstore) readCommits(commitC <-chan *string, errorC <-chan error) {
 ```
 
 Key Value Store快照数据的创建和恢复非常简单，直接使用JSON序列化/反序列化
+
+`getSnapshot()`是把当前store的内容作为一个快照返回，快照数据的持久化封装在snapshotter对象中
+
 ```go
-// 创建快照数据， TODO; 如何持久化
 func (s *kvstore) getSnapshot() ([]byte, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -162,7 +164,8 @@ func (s *kvstore) recoverFromSnapshot(snapshot []byte) error {
 ```
 
 Key Value的查找和更新同样简单。
-> TODO 对于Propse()函数，注意它没有返回值，所以如果客户端如何确定提交是成功还是失败？
+> 对于Propse()函数，注意它没有返回值，所以客户端如何确定提交是成功还是失败？
+> raftexample 没有处理这个问题，但是etcd raft内部的Propose() 是有返回值的
 
 ```go
 func (s *kvstore) Lookup(key string) (string, bool) {
@@ -505,7 +508,7 @@ func (rc *raftNode) startRaft() {
 - `rc.commitC <- nil` 通知KVStore的`s.readCommits()`协程去加载快照，注意这是commitC的第一条记录，因此保证了`s.readCommits()`总是先加载快照（这里），然后才回放WAL记录（在后面的`rc.publishEntries()`中)
 
 > WAL是一系列默认大小为64MB的文件，超过这个长度会进行切割，文件名为`<seq>-<index>.wal`，seq是文件的序号，index是raft协议中已经committed的index。
-> TODO快照和WAL的具体实现在另外一篇单独的文章中
+> 快照和WAL的具体实现在另外一篇单独的文章中
 
 ```go
 // replayWAL replays WAL entries into the raft instance.
