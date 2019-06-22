@@ -608,49 +608,7 @@ func (ln stoppableListener) Accept() (c net.Conn, err error) {
 
 `err = (&http.Server{Handler: rc.transport.Handler()}).Serve(ln)`新建了一个`http.Server`对象，其中使用了自定义的Handler`rc.transport.Handler()`，最后在这个`http.Server`对象上监听刚才创建的stoppableListener
 
-这里自定义的Handler是一个`ServeMux`对象——一个路由，它把进来的请求继续分发到不同路径对应的handler去处理。这里的`pipelineHandler`,`streamHandler`,`snapHandler`,`probing.NewHandler()`全都实现了`ServeHTTP()`方法。这一部分留到网络部分再细看。
 
-
-```go
-func (t *Transport) Handler() http.Handler {
-	pipelineHandler := newPipelineHandler(t, t.Raft, t.ClusterID)
-	streamHandler := newStreamHandler(t, t, t.Raft, t.ID, t.ClusterID)
-	snapHandler := newSnapshotHandler(t, t.Raft, t.Snapshotter, t.ClusterID)
-	mux := http.NewServeMux()
-	mux.Handle(RaftPrefix, pipelineHandler)
-	mux.Handle(RaftStreamPrefix+"/", streamHandler)
-	mux.Handle(RaftSnapshotPrefix, snapHandler)
-	mux.Handle(ProbingPrefix, probing.NewHandler())
-	return mux
-}
-```
-
-把常量替换一下，可以看到实际的路由如下
-
-```go
-func (t *Transport) Handler() http.Handler {
-	pipelineHandler := newPipelineHandler(t, t.Raft, t.ClusterID)
-	streamHandler := newStreamHandler(t, t, t.Raft, t.ID, t.ClusterID)
-	snapHandler := newSnapshotHandler(t, t.Raft, t.Snapshotter, t.ClusterID)
-	mux := http.NewServeMux()
-	mux.Handle("/raft", pipelineHandler)
-	mux.Handle("/raft/stream"+"/", streamHandler)
-	mux.Handle("/raft/snapshot", snapHandler)
-	mux.Handle("/raft/probing", probing.NewHandler())
-	return mux
-}
-```
-
-举例看看`probing.NewHandler()`的`ServerHTTP()`方法，就是返回一个OK和时间戳，其他三种handler留待网络部分再看.
-
-```go
-func (h *httpHealth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	health := Health{OK: true, Now: time.Now()}
-	e := json.NewEncoder(w)
-	e.Encode(health)
-}
-
-```
 
 ### Raft协议处理
 

@@ -4,6 +4,8 @@ Too Complex, Didn't Write
 
 ## Transport
 
+
+
 ### Tranposrt接口
 
 ```go
@@ -99,6 +101,56 @@ type Transport struct {
 }
 ```
 
+其中的Raft字段就是raftexample中的raftNode
+
+
+### Transport handler
+
+这里自定义的Handler是一个`ServeMux`对象——一个路由，它把进来的请求继续分发到不同路径对应的handler去处理。这里的`pipelineHandler`,`streamHandler`,`snapHandler`,`probing.NewHandler()`全都实现了`ServeHTTP()`方法。这一部分留到网络部分再细看。
+
+
+```go
+func (t *Transport) Handler() http.Handler {
+	pipelineHandler := newPipelineHandler(t, t.Raft, t.ClusterID)
+	streamHandler := newStreamHandler(t, t, t.Raft, t.ID, t.ClusterID)
+	snapHandler := newSnapshotHandler(t, t.Raft, t.Snapshotter, t.ClusterID)
+	mux := http.NewServeMux()
+	mux.Handle(RaftPrefix, pipelineHandler)
+	mux.Handle(RaftStreamPrefix+"/", streamHandler)
+	mux.Handle(RaftSnapshotPrefix, snapHandler)
+	mux.Handle(ProbingPrefix, probing.NewHandler())
+	return mux
+}
+```
+
+把常量替换一下，可以看到实际的路由如下
+
+```go
+func (t *Transport) Handler() http.Handler {
+	pipelineHandler := newPipelineHandler(t, t.Raft, t.ClusterID)
+	streamHandler := newStreamHandler(t, t, t.Raft, t.ID, t.ClusterID)
+	snapHandler := newSnapshotHandler(t, t.Raft, t.Snapshotter, t.ClusterID)
+	mux := http.NewServeMux()
+	mux.Handle("/raft", pipelineHandler)
+	mux.Handle("/raft/stream"+"/", streamHandler)
+	mux.Handle("/raft/snapshot", snapHandler)
+	mux.Handle("/raft/probing", probing.NewHandler())
+	return mux
+}
+```
+
+其中/raft/snapshot应该是用来处理快照的，/raft/probing用来检测对方是否存活
+
+举例看看`probing.NewHandler()`的`ServerHTTP()`方法，就是返回一个OK和时间戳
+
+```go
+func (h *httpHealth) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	health := Health{OK: true, Now: time.Now()}
+	e := json.NewEncoder(w)
+	e.Encode(health)
+}
+```
+
 ### Raft接口
 `Transport`中定义了一个`Raft`的接口
 
@@ -111,7 +163,6 @@ type Raft interface {
 }
 ```
 
-=
 `raftexample` 同样实现了这几个接口，注意`Process()`这个函数，收到消息后要求`rc.node.Step(ctx, m)`，这是在`startRaft()`中设置的：
 
 ```go
@@ -134,6 +185,118 @@ func (rc *raftNode) IsIDRemoved(id uint64) bool                           { retu
 func (rc *raftNode) ReportUnreachable(id uint64)                          {}
 func (rc *raftNode) ReportSnapshot(id uint64, status raft.SnapshotStatus) {}
 ```
+
+`rc.node.Step()`的实现请看[](./7-etcd_raft_node.md)和[](./9-etcd_raft.md)，这是ecd raft消息处理的入口
+
+
+### PipelineHandler
+
+这里的r就是raftexample中的raftNode，因为它实现了上面说的Raft接口
+
+```go
+// newPipelineHandler returns a handler for handling raft messages
+// from pipeline for RaftPrefix.
+//
+// The handler reads out the raft message from request body,
+// and forwards it to the given raft state machine for processing.
+func newPipelineHandler(t *Transport, r Raft, cid types.ID) http.Handler {
+	return &pipelineHandler{
+		lg:      t.Logger,
+		localID: t.ID,
+		tr:      t,
+		r:       r,
+		cid:     cid,
+	}
+}
+```
+
+```go
+func (h *pipelineHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		w.Header().Set("Allow", "POST")
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	w.Header().Set("X-Etcd-Cluster-ID", h.cid.String())
+
+	if err := checkClusterCompatibilityFromHeader(h.lg, h.localID, r.Header, h.cid); err != nil {
+		http.Error(w, err.Error(), http.StatusPreconditionFailed)
+		return
+	}
+
+	addRemoteFromRequest(h.tr, r)
+
+	// Limit the data size that could be read from the request body, which ensures that read from
+	// connection will not time out accidentally due to possible blocking in underlying implementation.
+	limitedr := pioutil.NewLimitedBufferReader(r.Body, connReadLimitByte)
+	b, err := ioutil.ReadAll(limitedr)
+	if err != nil {
+		if h.lg != nil {
+			h.lg.Warn(
+				"failed to read Raft message",
+				zap.String("local-member-id", h.localID.String()),
+				zap.Error(err),
+			)
+		} else {
+			plog.Errorf("failed to read raft message (%v)", err)
+		}
+		http.Error(w, "error reading raft message", http.StatusBadRequest)
+		recvFailures.WithLabelValues(r.RemoteAddr).Inc()
+		return
+	}
+
+	var m raftpb.Message
+	if err := m.Unmarshal(b); err != nil {
+		if h.lg != nil {
+			h.lg.Warn(
+				"failed to unmarshal Raft message",
+				zap.String("local-member-id", h.localID.String()),
+				zap.Error(err),
+			)
+		} else {
+			plog.Errorf("failed to unmarshal raft message (%v)", err)
+		}
+		http.Error(w, "error unmarshaling raft message", http.StatusBadRequest)
+		recvFailures.WithLabelValues(r.RemoteAddr).Inc()
+		return
+	}
+
+	receivedBytes.WithLabelValues(types.ID(m.From).String()).Add(float64(len(b)))
+
+	if err := h.r.Process(context.TODO(), m); err != nil {
+		switch v := err.(type) {
+		case writerToResponse:
+			v.WriteTo(w)
+		default:
+			if h.lg != nil {
+				h.lg.Warn(
+					"failed to process Raft message",
+					zap.String("local-member-id", h.localID.String()),
+					zap.Error(err),
+				)
+			} else {
+				plog.Warningf("failed to process raft message (%v)", err)
+			}
+			http.Error(w, "error processing raft message", http.StatusInternalServerError)
+			w.(http.Flusher).Flush()
+			// disconnect the http stream
+			panic(err)
+		}
+		return
+	}
+
+	// Write StatusNoContent header after the message has been processed by
+	// raft, which facilitates the client to report MsgSnap status.
+	w.WriteHeader(http.StatusNoContent)
+}
+```
+
+这里最重要的就是`h.r.Process(context.TODO(), m)`，把收到的消息发给raft协议去处理
+
+### 其他Handler
+
+略，应该是要处理的消息以及响应不同，没具体看有什么不同
 
 ### 发送消息到多节点
 
